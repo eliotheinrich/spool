@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdbool.h>
 
+#include "rbtree.h"
+
+#define ROOT_NODE 0
+
 typedef struct inode {
   // file type/permissions
   uint32_t mode;
@@ -19,30 +23,33 @@ typedef struct inode {
 
   // storage shape
   uint64_t ptr;
-  uint32_t size;
+  uint64_t size;
 
   // pointer count
   uint32_t link_count;
 } inode;
 
-static const uint32_t FILETYPE_FILE = 0b01;
-static const uint32_t FILETYPE_DIR  = 0b10;
-static const uint32_t FILETYPE_MASK = 0b11;
+static const uint32_t FILETYPE_FILE = 0b001;
+static const uint32_t FILETYPE_DIR  = 0b010;
+static const uint32_t FILETYPE_ROOT = 0b100;
 
-static const uint32_t BLOCK_SIZE = 1024;
-static const uint32_t NUM_BLOCKS = 100;
+static const uint32_t BLOCK_SIZE = 102400;
+static const uint32_t NUM_BLOCKS = 1;
 
-// Returns the root portion of the path
-void split_root(const char* path, char** first, char** rest);
-// Returns the child portion of the path
-void split_parent(const char *path, char **parent_out, char **name_out);
+static const uint64_t HEADER_SIZE = 2*sizeof(uint64_t);
 
+char **init_filesystem(rb_tree **t);
+char **malloc_blocks(int num_blocks, int block_size);
+
+char *path_first(const char *path, const char **rest);
+char *path_last(const char *path, const char **rest);
 char **split_string(const char *s, char delim);
+void remove_element(const char *data, size_t size, const char *str, char **out, size_t *out_size);
 
-inode *create_file(uint32_t uid, uint32_t gid, uint32_t size);
+char **get_subdirectories(const char *data, uint64_t size, uint64_t **inode_numbers);
 
-void write_inode(inode *node, int inode_number, char **metadata);
-void read_inode(inode *node, int inode_number, char **metadata);
+void write_inode(char **storage, inode *node, uint64_t ptr);
+inode *read_inode(char **storage, uint64_t ptr);
 
 bool inodes_equal(inode *node1, inode *node2);
 void print_inode(inode *node);
@@ -52,26 +59,32 @@ void print_inode(inode *node);
 // where N is the number of bytes in each block, P is the pointer to the next block, and D is the bytes
 
 // Stores a block of data in storage starting at ptr
-int write_data(uint64_t ptr, char *data, uint32_t size, char **storage);
-int write_inode_data(inode *node, char *data, char **storage);
+int write_chunk(char **storage, uint64_t ptr, uint64_t size, const char *data);
+int write_to_chunk(char **storage, uint64_t ptr, uint64_t size, const char *data, uint64_t start);
+// Reads a block of data in storage starting at ptr
+int read_data_offset(const char **storage, uint64_t ptr, uint64_t size, char *data_ptr, uint64_t start);
+int read_data(const char **storage, uint64_t ptr, uint64_t size, char *data);
 
-int read_data(uint64_t ptr, char **data_ptr, uint32_t size, char **storage);
-int read_inode_data(inode *node, char **data_ptr, char **storage);
+uint64_t read_u64(const char *data);
+void write_u64(char *data, uint64_t value);
 
-char **malloc_blocks(int num_blocks, int block_size);
+char *read_inode_content(const char **storage, const inode *node);
+void replace_inode_content(char **storage, rb_tree *t, uint64_t node_ptr, const char *data, uint64_t size);
 
-void write_inode_metadata(inode *node, char *data, char **metadata);
-char *read_inode_metadata(inode *node, char **metadata);
+inode *create_inode(uint32_t uid, uint32_t gid, uint32_t mode, uint32_t size);
 
-//char *write_tree(const Node *root, size_t *out_size);
-//Node *read_tree(const char *buffer);
-//bool trees_equal(const Node* r1, const Node* r2);
-//Node *make_root();
-//Node *load_filesystem(int backing_fd);
-//Node *create_node(const char *name, const char *content, NodeType type);
-//void print_tree(const Node *root);
-//Node *find_node(Node *node, const char *path);
-//void add_child(Node *root, Node *node);
-//void free_tree(Node *node);
+uint64_t get_tail_ptr(const char **storage, uint64_t ptr);
+int append_to_inode(rb_tree *t, char **storage, const char *data, uint64_t size, uint64_t node_ptr);
+void add_child(rb_tree *t, char **storage, const char *filename, uint64_t parent_ptr, uint64_t node_ptr);
+
+uint64_t make_file(rb_tree *t, char **storage, uint64_t parent_ptr, const char *name, const char *data, uint64_t size);
+uint64_t make_directory(rb_tree *t, char **storage, uint64_t parent_ptr, const char *name);
+
+inode *find_inode(const char **storage, const char *path, uint64_t *node_ptr);
+
+void free_chunks(char **storage, rb_tree *t, uint64_t ptr);
+int free_inode(char **storage, rb_tree *t, uint64_t node_ptr);
+int remove_directory(char **storage, rb_tree *t, uint64_t node_ptr);
+int remove_file(char **storage, rb_tree *t, uint64_t node_ptr);
 
 #endif

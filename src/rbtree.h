@@ -71,5 +71,9 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size);
 
 void update_augmented_upwards(rb_node *n, rb_tree *t);
 
+void print_tree_recursive(rb_node *n, int depth);
+void print_tree(rb_tree *t);
+
+
 #endif /* RBTREE_H */
 

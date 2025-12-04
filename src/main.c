@@ -8,123 +8,163 @@
 
 #include "node.h"
 
-#define FILE_SIZE 1024
-#define METADATA_SIZE 128
-static char file_contents[FILE_SIZE];
+char **storage;
+rb_tree *t;
 
-Node* root;
-
-static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler,
-	off_t offset, struct fuse_file_info *fi,
-	enum fuse_readdir_flags flags) {
-
-  Node *dir = find_node(root, path);
-  if (!dir || dir->type != FILETYPE_DIR) {
-    return -ENOENT;
-  }
-
-	filler(data, ".", NULL, 0, 0);
-	filler(data, "..", NULL, 0, 0);
-  for (int i = 0; i < dir->n_children; i++) {
-    Node *child = dir->children[i];
-    filler(data, child->name, NULL, 0, 0);
-  }
-
-	return 0;
-}
-
-static int fs_mkdir(const char *path, mode_t mode) {
-  char *parent_path, *dirname;
-  split_parent(path, &parent_path, &dirname);
-
-  Node *parent = find_node(root, parent_path);
-  if (!parent) {
-    free(dirname);
-    free(parent_path);
-    return -ENOENT;
-  }
-
-  Node *child = create_node(dirname, NULL, FILETYPE_DIR);
-  add_child(parent, child);
-
-  free(dirname);
-  free(parent_path);
-  return 0;
-}
-
-static int fs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
-  if (strcmp(path, "/") == 0) {
-		st->st_mode = S_IFDIR | 0755;  // directory
-		st->st_nlink = 2;
-  } else {
-    Node *node = find_node(root, path);
-    if (!node) {
-      printf("On getattr(%s), did not find the node.\n", path);
-      return -ENOENT;
-    }
-
-    if (node->type == FILETYPE_DIR)  {
-      st->st_mode = S_IFDIR | 0755;  // directory
-      st->st_nlink = 2;
-      printf("On getattr(%s), found a directory.\n", path);
-    } else {
-      st->st_mode = S_IFREG | 0644;  // regular file
-      st->st_nlink = 1;
-      st->st_size = node->size;
-
-      printf("On getattr(%s), found a file.\n", path);
-    }
-  }
-
-	return 0;
-}
-
-static int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-  Node *node = find_node(root, path);
+static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
 
-  if (node->type == FILETYPE_DIR) {
+  filler(data, ".", NULL, 0, 0);
+  filler(data, "..", NULL, 0, 0);
+
+  char *content = read_inode_content(storage, node);
+  uint64_t *inode_numbers = NULL;
+  char **subdirs = get_subdirectories(content, node->size, &inode_numbers);
+
+  if (subdirs) {
+    char **p = subdirs;
+    while (*p) {
+      filler(data, *p, NULL, 0, 0);
+      p++;
+    }
+  } 
+
+  free(node);
+  free(content);
+  free(inode_numbers);
+  free(subdirs);
+
+  return 0;
+}
+
+static int fs_mkdir(const char *path, mode_t mode) {
+  char *rest;
+  char *filename = path_last(path, &rest);
+  
+  uint64_t parent_ptr;
+  inode *parent = find_inode(storage, rest, &parent_ptr);
+  if (!parent || !(parent->mode & FILETYPE_DIR)) {
+    free(parent);
+    free(filename);
+    return -ENOENT;
+  }
+
+  uint64_t node_ptr = make_directory(t, storage, parent_ptr, filename);
+
+  free(parent);
+  free(filename);
+
+  return 0;
+}
+
+static int fs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node) {
+    return -ENOENT;
+  }
+
+  if (node->mode & FILETYPE_DIR) {
+    st->st_mode = S_IFDIR | 0755;
+    st->st_nlink = node->link_count;
+  } else {
+    st->st_mode = S_IFREG | 0644;
+    st->st_nlink = 1;
+    st->st_size = node->size;
+  }
+
+  free(node);
+	return 0;
+}
+
+static int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+
+  if (!node) {
+    return -ENOENT;
+  }
+
+  if (node->mode & FILETYPE_DIR) {
     return -EISDIR;
   }
 
-  
-  size_t required = offset + size;
-  printf("required = %i, offset = %i, size = %i\n", required, offset, size);
-  printf("buf = %s\n", buf);
-  if (required > node->size) {
-    char *new_content = realloc(node->content, required);
+  size_t node_size = node->size;
+  size_t to_write = 0;
+  size_t append_size = 0;
 
-    node->content = new_content;
-    node->size = required;
+  if (offset < node_size) {
+    // bytes that will overwrite existing data
+    to_write = (size <= node_size - offset) ? size : node_size - offset;
   }
 
-  memcpy(node->content + offset, buf, size);
+  if (offset + size > node_size) {
+    // bytes that need to be appended
+    append_size = offset + size - node_size;
+  }
+
+  // overwrite existing data
+  if (to_write > 0) {
+    write_to_data(storage, node->ptr, to_write, buf, offset);
+  }
+
+  // append new data
+  if (append_size > 0) {
+    append_to_inode(t, storage, buf + to_write, append_size, node_ptr);
+  }
 
   return size;
+
 }
 
 static int fs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
-  if (strcmp(path, "/file") != 0)
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node) {
     return -ENOENT;
-
-  // simple: zero out if truncated smaller
-  if (size < FILE_SIZE) {
-    memset(file_contents + size, 0, FILE_SIZE - size);
   }
 
+  if (node->mode & FILETYPE_DIR) {
+    return -EISDIR;
+  }
+
+  if ((size_t)size < node->size) {
+    // truncate file: remove bytes from the end
+    //truncate_inode(storage, node_ptr, size);  // implement this
+  } else if ((size_t)size > node->size) {
+    // expand file: append zeros
+    append_to_inode(t, storage, NULL, size - node->size, node_ptr);
+  }
+
+  node->size = size;
+  write_inode(storage, node, node_ptr);
   return 0;
 }
 
 static int fs_open(const char *path, struct fuse_file_info *fi) {
-  // Allow writing
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node) {
+    return -ENOENT;
+  }
+
+  if ((fi->flags & O_ACCMODE) != O_RDONLY && (node->mode & FILETYPE_FILE) == 0) {
+    free(node);
+    return -EACCES;
+  }
+
+  free(node);
   return 0;
 }
 
 static int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-  Node *node = find_node(root, path);
-  if (!node || node->type != FILETYPE_FILE) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node || !(node->mode & FILETYPE_FILE)) {
     return -ENOENT;
   }
 
@@ -136,37 +176,34 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset, struc
     size = node->size - offset;
   }
 
-  memcpy(buf, node->content + offset, size);
+  read_data_offset(storage, node->ptr, node->size, buf, (uint64_t) offset);
   return size;
 }
 
 static int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
-  char *parent_path, *name;
-  split_parent(path, &parent_path, &name);
-
-  Node *parent = find_node(root, parent_path);
-  printf("Found parent directory:\n");
-  print_tree(parent);
-  if (!parent || parent->type != FILETYPE_DIR) {
-    free(parent_path);
-    free(name);
-    printf("Parent does not exist.\n");
+  char *rest;
+  char *filename = path_last(path, &rest);
+  
+  uint64_t parent_ptr;
+  inode *parent = find_inode(storage, rest, &parent_ptr);
+  if (!parent || !(parent->mode & FILETYPE_DIR)) {
+    free(filename);
+    free(parent);
     return -ENOENT;
   }
+  free(parent);
 
-  if (find_node(parent, name)) {
-    free(parent_path);
-    free(name);
-    printf("File already exists.\n");
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (node) {
+    free(filename);
+    free(node);
     return -EEXIST;
   }
 
-  Node *child = create_node(name, NULL, FILETYPE_FILE);
-  add_child(parent, child);
+  node_ptr = make_file(t, storage, parent_ptr, filename, NULL, 0);
 
-  free(parent_path);
-  free(name);
-  printf("Exiting normal way.\n");
+  free(filename);
   return 0;
 }
 
@@ -178,12 +215,90 @@ static int fs_mknod(const char *path, mode_t mode, dev_t rdev) {
   return fs_create(path, mode, NULL);
 }
 
-// TODO add proper timestamp support
-static int fs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi) {
-  Node *node = find_node(root, path);
+static int fs_unlink(const char *path) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node) {
+    free(node);
+    return -ENOENT;
+  }
+
+  if (node->mode & FILETYPE_ROOT) {
+    free(node);
+    return -1;
+  }
+
+  if (!(node->mode & FILETYPE_DIR)) {
+    free(node);
+    return -EISDIR;
+  }
+
+  free(node);
+
+  char *rest;
+  char *filename = path_last(path, rest);
+
+  uint64_t parent_ptr;
+  inode *parent = find_inode(storage, rest, &parent_ptr);
+
+  if (!parent) {
+    return -1;
+  }
+
+  char *parent_content = read_inode_content(storage, parent);
+  char *removed;
+  size_t out_size;
+  remove_element(parent_content, parent->size, filename, &removed, &out_size);
+  replace_inode_content(storage, t, parent_ptr, removed, out_size);
+  remove_directory(storage, t, node_ptr);
+
+  free(parent);
+  free(parent_content);
+  free(removed);
+  free(filename); 
+  free(rest);
+
+  return 0;
+}
+
+static int fs_rmdir(const char *path) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
+
+  if (!(node->mode & FILETYPE_DIR)) {
+    free(node);
+    return -ENOTDIR; 
+  }
+
+  if (node->size != 0) {
+    free(node);
+    return -ENOTEMPTY;
+  }
+
+  fs_unlink(path);
+
+  free(node);
+  return 0; 
+}
+
+static int fs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi) {
+  uint64_t node_ptr;
+  inode *node = find_inode(storage, path, &node_ptr);
+  if (!node) {
+    return -ENOENT;
+  }
+
+  node->atime = tv[0].tv_sec;
+  node->mtime = tv[1].tv_sec;
+
+  node->ctime = time(NULL);
+
+  write_inode(storage, node, node_ptr);
+
+  free(node);
 
   return 0;
 }
@@ -198,15 +313,17 @@ struct fuse_operations fsops = {
   .mkdir = fs_mkdir,
   .mknod = fs_mknod,
   .create = fs_create,
+  .rmdir = fs_rmdir,
+  .unlink = fs_unlink,
   .utimens = fs_utimens,
 };
 
 int main(int argc, char **argv) {
-  int backing_fd = open("backing.img", O_RDWR | O_CREAT, 0644);
-  root = load_filesystem(backing_fd);
+  storage = init_filesystem(&t);
 
-  //ftruncate(backing_fd, 1024); // allocate 1 KB for example
   int result = fuse_main(argc, argv, &fsops, NULL);
-  free_tree(root);
+
+  rb_tree(t);
+  free(storage);
   return result;
 }

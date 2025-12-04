@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/time.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 
 #include "rbtree.h"
@@ -75,123 +76,417 @@ static bool name_in_list(char **names, size_t count, const char *target) {
   return false;
 }
 
-int block = 0;
-int offset = 0;
+unsigned get_seed() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  unsigned seed = (unsigned) tv.tv_usec;
+  return seed;
+}
 
-int get_free_ptr(uint64_t data_size, uint64_t *ptr) {
-  // Need to store data and header
-  uint64_t header_size = sizeof(uint64_t) + sizeof(uint64_t);
-  uint64_t size = data_size + header_size;
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
 
-  uint64_t cur_ptr = block * BLOCK_SIZE + offset;
-  *ptr = cur_ptr;
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-  uint64_t remaining_size = size;
-  while (offset + remaining_size >= BLOCK_SIZE) {
-    block++;
-    cur_ptr += BLOCK_SIZE;
-    remaining_size -= BLOCK_SIZE;
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-    if (block >= NUM_BLOCKS) {
-      return -1;
+bool test_remove_element() {
+  char data[128]; 
+  size_t size = 0;
+  uint64_t id1 = 1,id2 = 2,id3 = 3;
+  memcpy(data + size, &id1, 8); 
+  size += 8; 
+  memcpy(data + size,"foo",3); 
+  size += 3; 
+  data[size++] = ',';
+  memcpy(data + size, &id2,8 );
+  size += 8; 
+  memcpy(data + size, "bar", 3); 
+  size += 3; 
+  data[size++] = ',';
+  memcpy(data + size, &id3, 8); 
+  size += 8; 
+  memcpy(data + size, "baz", 3);
+  size += 3; 
+  data[size++] = ',';
+
+  char *out = NULL; 
+  size_t out_size = 0;
+  remove_element(data, size, "bar", &out, &out_size);
+
+  size_t i = 0; int count=0;
+  while (i + sizeof(uint64_t) <= out_size) {
+    uint64_t id; 
+    memcpy(&id, out + i, sizeof(uint64_t)); 
+    i += sizeof(uint64_t);
+    size_t start = i; 
+    while (i < out_size && out[i] != ',') {
+      i++;
+    }
+    char *s = out + start; 
+    size_t len = i - start;
+    if (id == 1) { 
+      if (len != 3 || strncmp(s, "foo", 3) != 0) {
+        free(out); 
+        return false; 
+      }
+    }
+    else if (id == 3) { 
+      if (len != 3 || strncmp(s, "baz", 3) != 0) {
+        free(out); 
+        return false; 
+      } 
+    }
+    else { 
+      free(out); 
+      return false; 
+    }
+    count++; 
+    i++;
+  }
+
+  free(out);
+  return count == 2;
+}
+
+// Helper function to compare string arrays
+bool compare_arrays(char **result, const char **expected, int count) {
+  if (result == NULL && expected == NULL) {
+    return true;
+  }
+
+  if (result == NULL || expected == NULL) {
+    return false;
+  }
+
+  for (int i = 0; i < count; i++) {
+    if (result[i] == NULL && expected[i] == NULL) {
+      continue;
+    }
+
+    if (result[i] == NULL || expected[i] == NULL) {
+      return false;
+    }
+
+    if (strcmp(result[i], expected[i]) != 0) {
+      return false;
     }
   }
 
-  cur_ptr += remaining_size;
-  offset += remaining_size;
-
-  return 0;
+  // Check that result is NULL-terminated
+  return result[count] == NULL;
 }
 
-bool test_serialize_inode() {
-  inode *node = create_file(1, 1, 10);
-  uint64_t inode_number = 20;
-
-  char **inode_metadata = malloc_blocks(NUM_BLOCKS, BLOCK_SIZE);
-
-  write_inode(node, inode_number, inode_metadata);
-
-  inode *new_node = malloc(sizeof(inode));
-  read_inode(new_node, inode_number, inode_metadata);
-
-  printf("Before: \n");
-  print_inode(node);
-  printf("After: \n");
-  print_inode(new_node);
-
-  ASSERT(inodes_equal(node, new_node));
-
-  free(node);
-  free(new_node);
-  free(inode_metadata);
-  return true;
+// Helper function to free the result
+void free_result(char **result) {
+  if (result == NULL) return;
+  for (int i = 0; result[i] != NULL; i++) {
+    free(result[i]);
+  }
+  free(result);
 }
 
-bool test_get_inode_data() {
+bool test_split_string() {
+  char **result;
+  bool all_passed = true;
+
+  // Test 1: Basic split with comma
+  result = split_string("apple,banana,cherry", ',');
+  const char *expected1[] = {"apple", "banana", "cherry", NULL};
+  if (!compare_arrays(result, expected1, 3)) {
+    printf("Test 1 failed: Basic split with comma\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 2: Split with spaces
+  result = split_string("hello world test", ' ');
+  const char *expected2[] = {"hello", "world", "test", NULL};
+  if (!compare_arrays(result, expected2, 3)) {
+    printf("Test 2 failed: Split with spaces\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 3: Empty string
+  result = split_string("", ',');
+  const char *expected3[] = {NULL};
+  if (!compare_arrays(result, expected3, 0)) {
+    printf("Test 3 failed: Empty string should return 0 elements\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 4: String with no delimiter
+  result = split_string("hello", ',');
+  const char *expected4[] = {"hello", NULL};
+  if (!compare_arrays(result, expected4, 1)) {
+    printf("Test 4 failed: String with no delimiter\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 5: Multiple consecutive delimiters
+  result = split_string("a,,b,,,c", ',');
+  const char *expected5[] = {"a", "", "b", "", "", "c", NULL};
+  if (!compare_arrays(result, expected5, 6)) {
+    printf("Test 5 failed: Multiple consecutive delimiters\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 6: Delimiter at start and end
+  result = split_string(",hello,world,", ',');
+  const char *expected6[] = {"", "hello", "world", "", NULL};
+  if (!compare_arrays(result, expected6, 4)) {
+    printf("Test 6 failed: Delimiter at start and end\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 7: Single character
+  result = split_string("a", ',');
+  const char *expected7[] = {"a", NULL};
+  if (!compare_arrays(result, expected7, 1)) {
+    printf("Test 7 failed: Single character\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 8: Only delimiters
+  result = split_string(",,,", ',');
+  const char *expected8[] = {"", "", "", "", NULL};
+  if (!compare_arrays(result, expected8, 4)) {
+    printf("Test 8 failed: Only delimiters\n");
+    all_passed = false;
+  }
+  free_result(result);
+
+  // Test 9: NULL input (if your function handles it)
+  result = split_string(NULL, ',');
+  if (result != NULL) {
+    printf("Test 9 failed: NULL input should return NULL\n");
+    all_passed = false;
+    free_result(result);
+  }
+
+  return all_passed;
+}
+
+bool test_read_data_offset_basic() {
+  unsigned seed = get_seed();
+  printf("seed = %i\n", seed);
+  srand(seed);
+
   char **storage = malloc_blocks(NUM_BLOCKS, BLOCK_SIZE);
+  uint64_t block0 = 0;
+  uint64_t offset0 = 4;
+  uint64_t ptr0 = offset0 + block0*BLOCK_SIZE;
+  uint64_t chunk_size0 = BLOCK_SIZE + 10;
 
-  char *content = strdup("Hello, world!");
-  int size = strlen(content);
-  inode *node = create_file(0, 0, sizeof(char)*size);
+  uint64_t block1 = 3;
+  uint64_t offset1 = 5;
+  uint64_t ptr1 = offset1 + block1*BLOCK_SIZE;
+  uint64_t chunk_size1 = 6;
 
-  write_inode_metadata(node, content, storage);
+  uint64_t block2 = 5;
+  uint64_t offset2 = 0;
+  uint64_t ptr2 = offset2 + block2*BLOCK_SIZE;
+  uint64_t chunk_size2 = 7;
 
-  char *new_content = read_inode_metadata(node, storage);
-  
-  printf("Before storage: %s, after storage = %s\n", content, new_content); 
-  ASSERT(strcmp(content, new_content) == 0);
+  uint64_t size = chunk_size0 + chunk_size1 + chunk_size2;
 
-  free(node);
-  free(content);
-  free(new_content);
+  uint64_t zero = 0;
+  memcpy(storage[block0] + offset0,                    &ptr1, sizeof(uint64_t));
+  memcpy(storage[block0] + offset0 + sizeof(uint64_t), &chunk_size0, sizeof(uint64_t));
+
+  memcpy(storage[block1] + offset1,                    &ptr2, sizeof(uint64_t));
+  memcpy(storage[block1] + offset1 + sizeof(uint64_t), &chunk_size1, sizeof(uint64_t));
+
+  memcpy(storage[block2] + offset2,                    &zero, sizeof(uint64_t));
+  memcpy(storage[block2] + offset2 + sizeof(uint64_t), &chunk_size2, sizeof(uint64_t));
+
+  for (uint64_t p = 0; p < chunk_size0; p++) {
+    uint64_t ptr = p + ptr0 + 2*sizeof(uint64_t);
+    uint64_t block = ptr / BLOCK_SIZE;
+    uint64_t offset = ptr % BLOCK_SIZE;
+    char val = p;
+    *(storage[block] + offset) = val;
+  }
+
+  for (uint64_t p = 0; p < chunk_size1; p++) {
+    uint64_t ptr = p + ptr1 + 2*sizeof(uint64_t);
+    uint64_t block = ptr / BLOCK_SIZE;
+    uint64_t offset = ptr % BLOCK_SIZE;
+    uint64_t val = p + chunk_size0;
+    *(storage[block] + offset) = val;
+  }
+
+  for (uint64_t p = 0; p < chunk_size2; p++) {
+    uint64_t ptr = p + ptr2 + 2*sizeof(uint64_t);
+    uint64_t block = ptr / BLOCK_SIZE;
+    uint64_t offset = ptr % BLOCK_SIZE;
+    uint64_t val = p + chunk_size0 + chunk_size1;
+    *(storage[block] + offset) = val;
+  }
+
+  uint64_t offset = rand() % size;
+  offset = 0;
+  char *buffer = malloc(size - offset);
+  read_data_offset(storage, ptr0, size - offset, buffer, offset);
+
+  for (int i = 0; i < size - offset; i++) {
+    ASSERT(buffer[i] == (char) i + offset);
+  }
+
+  free(buffer);
   free(storage);
   return true;
 }
 
-bool test_files() {
-  srand(time(NULL));
-  
-  uint64_t max_size = 4*BLOCK_SIZE;
-  uint64_t min_size = 4;
+bool test_read_data_offset() {
+  for (int k = 0; k < 10000; k++) {
+    unsigned seed = get_seed();
+    srand(seed);
 
-  uint64_t num_files = 20;
-  char **content = malloc(num_files*sizeof(char*));
-  uint64_t *sizes = malloc(num_files*sizeof(uint64_t));
+    rb_tree *t;
+    char **storage = init_filesystem(&t);
 
-  char **storage = malloc_blocks(NUM_BLOCKS, BLOCK_SIZE);
-  char **inode_metadata = malloc_blocks(NUM_BLOCKS, BLOCK_SIZE);
+    int n1 = 2*BLOCK_SIZE;
+    int n2 = 4*BLOCK_SIZE;
+    char *data1 = malloc(n1);
+    char *data2 = malloc(n2);
+    char *data3 = malloc(n1 + n2);
 
-  for (int i = 0; i < num_files; i++) {
-    sizes[i] = rand() % (max_size - min_size) + min_size;
-    content[i] = malloc(sizes[i]*sizeof(char));
-    for (int j = 0; j < sizes[i] - 1; j++) {
-      content[i][j] = (char)(32 + rand() % 95);
-
+    for (int i = 0; i < n1; i++) {
+      data1[i] = rand() % 92 + 32;
+      data3[i] = data1[i];
     }
-    content[i][sizes[i] - 1] = '\0';
+    for (int i = 0; i < n2; i++) {
+      data2[i] = rand() % 92 + 32;
+      data3[i + n1] = data2[i];
+    }
+
+    uint64_t node_ptr = make_file(t, storage, ROOT_NODE, "file", data1, n1);
+    append_to_inode(t, storage, data2, n2, node_ptr);
+
+    inode *node = read_inode(storage, node_ptr);
+    uint64_t offset = rand() % n1;
+    char *buffer = malloc(node->size - offset);
+    read_data_offset(storage, node->ptr, node->size - offset, buffer, offset);
+
+    for (int i = 0; i < n1 - offset; i++) {
+      ASSERT(data1[i + offset] == buffer[i]);
+    }
+
+    free(data1);
+    free(data2);
+    free(data3);
+    free(node);
+    rb_free(t);
+    free(storage);
+  }
+  return true;
+}
+
+bool test_write_data_offset() {
+  for (int k = 0; k < 1000; k++) {
+    unsigned seed = get_seed();
+    srand(seed);
+
+    rb_tree *t;
+    char **storage = init_filesystem(&t);
+
+    int n1 = 2*BLOCK_SIZE;
+    int n2 = 4*BLOCK_SIZE;
+    char *data1 = malloc(n1);
+    char *data2 = malloc(n2);
+    char *data3 = malloc(n1 + n2);
+
+    uint64_t ptr1 = 0;
+    uint64_t ptr2 = 3*BLOCK_SIZE + 24;
+    rb_malloc(t, ptr1, n1);
+    write_chunk(storage, ptr1, n1, data1);
+    memcpy(storage[ptr1/BLOCK_SIZE] + ptr1%BLOCK_SIZE, &ptr2, sizeof(uint64_t));
+    rb_malloc(t, ptr2, n2);
+    write_chunk(storage, ptr2, n2, data2);
+    write_to_data(storage, ptr1, n1, data1, n1);
+
+    int size = n1 + n2;
+
+    uint64_t offset = n1;
+    char *buffer = malloc(size - offset);
+    read_data_offset(storage, ptr1, size - offset, buffer, offset);
+
+    for (int i = 0; i < size - offset; i++) {
+      ASSERT(data1[i] == buffer[i]);
+    }
+
+    free(data1);
+    free(data2);
+    free(data3);
+    free(storage);
+  }
+  return true;
+}
+
+bool test_path_first_last() {
+  const char *p = "a/b/c";
+  const char *rest;
+
+  /* first */
+  char *f = path_first(p, &rest);
+  if (!f) {
+    return false;
+  }
+  if (strcmp(f, "a") != 0) { 
+    free(f); 
+    return false; 
+  }
+  if (!rest) { 
+    free(f); 
+    return false; 
+  }
+  if (strcmp(rest, "b/c") != 0) { 
+    free(f); 
+    return false; 
+  }
+  free(f);
+
+  /* last */
+  char *l = path_last(p, &rest);
+  if (!l) {
+    return false;
+  }
+  if (strcmp(l, "c") != 0) { 
+    free(l); 
+    return false; 
   }
 
-  inode **nodes = malloc(num_files*sizeof(inode*));
-
-  for (int i = 0; i < num_files; i++) {
-    nodes[i] = create_file(0, 0, sizeof(char)*sizes[i]);
-    write_inode_data(nodes[i], content[i], storage);
+  /* rest for last points into original string; compare prefix "a/b" */
+  const char *expected_rest = "a/b";
+  size_t erl = strlen(expected_rest);
+  if (strncmp(rest, expected_rest, erl) != 0) { 
+    free(l); 
+    return false; 
+  }
+  /* ensure boundary is correct (next char is '/' or end) */
+  if (rest[erl] != '/' && rest[erl] != '\0') { 
+    free(l); 
+    return false; 
   }
 
-  for (int i = 0; i < num_files; i++) {
-    char *result;
-    read_inode_data(nodes[i], &result, storage);
-    printf("Before: %s, after = %s, strlen = %li\n", content[i], result, strlen(result));
-    ASSERT(strcmp(result, content[i]) == 0);
-    free(result);
-  }
-
-  free(storage);
-  free(inode_metadata);
-  free(nodes);
-  free(content);
-  free(sizes);
-
+  free(l);
   return true;
 }
 
@@ -222,43 +517,6 @@ void print_int_tree(rb_tree *t) {
   print_int_tree_recursive(t->root, 0);
 }
 
-void print_tree_recursive(rb_node *n, int depth) {
-  if (!n) {
-    return;
-  }
-
-  // Indentation for current depth
-  for (int i = 0; i < depth; i++) {
-    printf("  ");
-  }
-
-  // Print current node info
-  block_t *blk = (block_t *)n->data;
-  block_aug_t *aug = (block_aug_t *)n->augmented;
-  char color = n->color == RED ? 'R' : 'B';
-
-  printf("[%d, %d] (color=%c", blk->ptr, blk->size, color);
-  if (aug) {
-    printf(", max_size=%d", aug->max_size);
-  }
-  printf(")\n");
-
-  // Print right subtree first (so it appears on top when printed)
-  print_tree_recursive(n->right, depth + 1);
-
-  // Print left subtree
-  print_tree_recursive(n->left, depth + 1);
-}
-
-void print_tree(rb_tree *t) {
-  if (!t) {
-    return;
-  }
-  printf("RB-tree (size=%zu):\n", t->size);
-  print_tree_recursive(t->root, 0);
-}
-
-
 bool int_less(const void *a, const void *b) {
   return *(int*)a < *(int*)b;
 }
@@ -266,16 +524,23 @@ bool int_less(const void *a, const void *b) {
 bool test_rbtree_basic() {
   rb_tree *t = rb_create(int_less, NULL, NULL);
 
-  int a = 10, b = 5, c = 20, d = 7;
-  rb_insert(t, &a, NULL);
-  rb_insert(t, &b, NULL);
-  rb_insert(t, &c, NULL);
-  rb_insert(t, &d, NULL);
+  int *a = malloc(sizeof(int));
+  *a = 10;
+  int *b = malloc(sizeof(int));
+  *b = 5;
+  int *c = malloc(sizeof(int));
+  *c = 20;
+  int *d = malloc(sizeof(int));
+  *d = 7;
+  rb_insert(t, a, NULL);
+  rb_insert(t, b, NULL);
+  rb_insert(t, c, NULL);
+  rb_insert(t, d, NULL);
 
-  ASSERT(*(int*)rb_find(t, &a) == 10);
-  ASSERT(*(int*)rb_find(t, &b) == 5);
-  ASSERT(*(int*)rb_find(t, &c) == 20);
-  ASSERT(*(int*)rb_find(t, &d) == 7);
+  ASSERT(*(int*)rb_find(t, a) == 10);
+  ASSERT(*(int*)rb_find(t, b) == 5);
+  ASSERT(*(int*)rb_find(t, c) == 20);
+  ASSERT(*(int*)rb_find(t, d) == 7);
 
   int missing = 99;
   ASSERT(rb_find(t, &missing) == NULL);
@@ -332,7 +597,9 @@ bool test_rbtree_stress() {
   // Fill with random integers
   for (size_t i = 0; i < N; i++) {
     vals[i] = rand();
-    rb_insert(t, &vals[i], NULL);
+    int *v = malloc(sizeof(int));
+    *v = vals[i];
+    rb_insert(t, v, NULL);
   }
 
   // Lookup every value
@@ -349,13 +616,6 @@ bool test_rbtree_stress() {
   free(vals);
   rb_free(t);
   return true;
-}
-
-unsigned get_seed() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  unsigned seed = (unsigned) tv.tv_usec;
-  return seed;
 }
 
 bool test_rbtree_delete_randomized() {
@@ -455,7 +715,9 @@ bool test_rbtree_successor_predecessor() {
   size_t n = sizeof(vals) / sizeof(vals[0]);
 
   for (size_t i = 0; i < n; i++) {
-    rb_insert(t, &vals[i], NULL);
+    int *v = malloc(sizeof(int));
+    *v = vals[i];
+    rb_insert(t, v, NULL);
   }
 
   // Test values that exist in the tree
@@ -567,117 +829,414 @@ int check_max_size(rb_node *n) {
   return correct_max;
 }
 
-// Function to shuffle an array using Fisher-Yates algorithm
-void shuffle(block_t *array, int n) {
-  for (int i = n - 1; i > 0; i--) {
-    int j = rand() % (i + 1); 
-    block_t temp = array[i];
-    array[i] = array[j];
-    array[j] = temp;
+bool validate_max_size(rb_node *node) {
+  if (!node) {
+    return true;
   }
+
+  uint64_t max_size = ((block_aug_t*)node->augmented)->max_size;
+  uint64_t size = ((block_t*)node->data)->size;
+
+  bool valid = max_size >= size;
+  if (node->left) {
+    uint64_t left_max = ((block_aug_t*)node->left->augmented)->max_size;
+    valid = valid && (max_size >= left_max) && validate_max_size(node->left);
+  }
+
+  if (node->right) {
+    uint64_t right_max = ((block_aug_t*)node->right->augmented)->max_size;
+    valid = valid && (max_size >= right_max) && validate_max_size(node->right);
+  }
+
+  return valid;
 }
 
-bool test_rbtree_augmented_randomized() {
-  for (int k = 0; k < 1000; k++) {
+bool *to_bitmap(rb_tree *t, uint64_t total_width) {
+  bool *freed = malloc(total_width*sizeof(bool));
+  for (int j = 0; j < total_width; j++) {
+    freed[j] = false;
+  }
+  
+  void traverse(rb_node *node) {
+    if (!node) {
+      return;
+    }
+
+    traverse(node->left);
+
+    block_t *block = (block_t *)node->data;
+    uint64_t ptr  = block->ptr;
+    uint64_t size = block->size;
+
+    uint64_t end = ptr + size;
+    if (end > total_width) {
+      end = total_width;
+    }
+
+    for (uint64_t j = ptr; j < end; j++) {
+      freed[j] = true;
+    }
+
+    traverse(node->right);
+  }
+
+  traverse(t->root);
+
+  return freed;
+}
+
+bool test_rbtree_malloc_randomized() {
+  for (int k = 0; k < 100; k++) {
     unsigned seed = get_seed();
     srand(seed);
 
-    rb_tree *t = create_block_file_rbtree(1000);
-    if (!t) {
-      return false;
+    uint64_t total_size = 100;
+    rb_tree *t = create_block_file_rbtree(total_size);
+
+    bool *freed = malloc(total_size*sizeof(bool));
+    for (int i = 0; i < total_size; i++) {
+      freed[i] = true;
     }
 
-    const int N = 1000;
-    int *sizes = malloc(sizeof(int)*N);
-    int *ptrs = malloc(sizeof(int)*N);
+    int nsteps = 10;
+    int64_t *ptrs = malloc(sizeof(int64_t)*nsteps);
+    int64_t *sizes = malloc(sizeof(int64_t)*nsteps);
 
-    // Insert random blocks
-    for (int i = 0; i < N; i++) {
-      block_t *block = malloc(sizeof(block_t));
-      block->ptr = rand() % 100000;
-      block->size = rand() % 1000 + 1;
-      ptrs[i] = block->ptr;
-      sizes[i] = block->size;
-      block_aug_t *aug = malloc(sizeof(block_aug_t));
-      aug->max_size = block->size;
-      rb_insert(t, block, aug);
+    for (int i = 0; i < nsteps; i++) {
+      int64_t r1 = rand() % total_size;
+      int64_t r2 = rand() % total_size;
+      while (abs(r2 - r1) < 2 && abs(r2 - r1) > 10) {
+        r2 = rand() % total_size;
+      }
+      if (r1 > r2) {
+        int64_t tmp = r2;
+        r2 = r1;
+        r1 = tmp;
+      }
+
+      ptrs[i] = r1;
+      sizes[i] = r2 - r1;
     }
 
-    check_max_size(t->root);
+    for (int i = 0; i < nsteps; i++) {
+      rb_malloc(t, ptrs[i], sizes[i]);
+      for (int j = ptrs[i]; j < ptrs[i] + sizes[i]; j++) {
+        freed[j] = false;
+      }
 
-    // Randomly delete half of the blocks
-    for (int i = 0; i < N/2; i++) {
-      block_t *block = malloc(sizeof(block_t));
-      block->ptr = ptrs[i];
-      block->size = sizes[i];
-      rb_delete(t, block);
-      check_max_size(t->root);
+      bool *freed_t = to_bitmap(t, total_size);
+      for (int j = 0; j < total_size; j++) {
+        ASSERT(freed[j] == freed_t[j]);
+      }
+      free(freed_t);
     }
 
     rb_free(t);
     free(ptrs);
     free(sizes);
+    free(freed);
+  }
+  return true;
+}
+
+bool test_rbtree_mfree_basic() {
+  uint64_t total_size = 10;
+  rb_tree *t = create_block_file_rbtree(total_size);
+  rb_malloc(t, 0, total_size);
+
+  bool *freed = malloc(total_size*sizeof(bool));
+  for (int i = 0; i < total_size; i++) {
+    freed[i] = false;
+  }
+
+  uint64_t ptr = 5;
+  uint64_t size = 3;
+  rb_mfree(t, ptr, size);
+  for (int j = ptr; j < ptr + size; j++) {
+    freed[j] = true;
+  }
+
+  ptr = 3;
+  size = 3;
+  rb_mfree(t, ptr, size);
+  for (int j = ptr; j < ptr + size; j++) {
+    freed[j] = true;
+  }
+
+  ptr = 6;
+  size = 3;
+  rb_mfree(t, ptr, size);
+  for (int j = ptr; j < ptr + size; j++) {
+    freed[j] = true;
+  }
+
+  bool *freed_t = to_bitmap(t, total_size);
+  for (int j = 0; j < total_size; j++) {
+    ASSERT(freed[j] == freed_t[j]);
+  }
+
+  rb_free(t);
+  free(freed);
+  free(freed_t);
+  return true;
+}
+
+bool test_rbtree_mfree_randomized() {
+  for (int k = 0; k < 1000; k++) {
+    unsigned seed = get_seed();
+    srand(seed);
+
+    uint64_t total_size = 100;
+    rb_tree *t = create_block_file_rbtree(total_size);
+    rb_malloc(t, 0, total_size);
+
+    bool *freed = malloc(total_size*sizeof(bool));
+    for (int i = 0; i < total_size; i++) {
+      freed[i] = false;
+    }
+
+    int nsteps = 10;
+    int64_t *ptrs = malloc(sizeof(int64_t)*nsteps);
+    int64_t *sizes = malloc(sizeof(int64_t)*nsteps);
+
+    for (int i = 0; i < nsteps; i++) {
+      int64_t r1 = rand() % total_size;
+      int64_t r2 = rand() % total_size;
+      while (abs(r2 - r1) < 2 || abs(r2 - r1) > 10) {
+        r2 = rand() % total_size;
+      }
+      if (r1 > r2) {
+        int64_t tmp = r2;
+        r2 = r1;
+        r1 = tmp;
+      }
+
+      ptrs[i] = r1;
+      sizes[i] = r2 - r1;
+    }
+
+    for (int i = 0; i < nsteps; i++) {
+      rb_mfree(t, ptrs[i], sizes[i]);
+      for (int j = ptrs[i]; j < ptrs[i] + sizes[i]; j++) {
+        freed[j] = true;
+      }
+
+      bool *freed_t = to_bitmap(t, total_size);
+      for (int j = 0; j < total_size; j++) {
+        ASSERT(freed[j] == freed_t[j]);
+      }
+      free(freed_t);
+    }
+
+    free(ptrs);
+    free(sizes);
+    free(freed);
+    rb_free(t);
   }
   return true;
 }
 
 bool test_rbtree_free_ptr() {
-  rb_tree *t = create_block_file_rbtree(1000);
-  rbtree_file_insert(t, 0, 100);
-  rbtree_file_insert(t, 150, 18);
+  for (int k = 0; k < 1000; k++) {
+    unsigned seed = get_seed();
+    srand(seed);
 
-  print_tree(t);
-  uint64_t ptr;
-  rb_get_free_ptr(t, 20, &ptr);
-  printf("found ptr = %li\n", ptr);
-  
+    uint64_t total_size = 100;
+    rb_tree *t = create_block_file_rbtree(total_size);
 
-  rb_free(t);
+    bool *freed = malloc(total_size*sizeof(bool));
+    for (int i = 0; i < total_size; i++) {
+      freed[i] = true;
+    }
+
+    int nsteps = 50;
+    int64_t *ptrs = malloc(sizeof(int64_t)*nsteps);
+    int64_t *sizes = malloc(sizeof(int64_t)*nsteps);
+
+    for (int i = 0; i < nsteps; i++) {
+      int64_t r1 = rand() % total_size;
+      int64_t r2 = rand() % total_size;
+      while (abs(r2 - r1) < 2 || abs(r2 - r1) > 10) {
+        r2 = rand() % total_size;
+      }
+      if (r1 > r2) {
+        int64_t tmp = r2;
+        r2 = r1;
+        r1 = tmp;
+      }
+
+      ptrs[i] = r1;
+      sizes[i] = r2 - r1;
+    }
+
+    for (int i = 0; i < nsteps; i++) {
+      float r = (float) rand()/INT_MAX;
+      if (r < 0.75) {
+        rb_malloc(t, ptrs[i], sizes[i]);
+        for (int j = ptrs[i]; j < ptrs[i] + sizes[i]; j++) {
+          freed[j] = false;
+        }
+      } else {
+        rb_mfree(t, ptrs[i], sizes[i]);
+        for (int j = ptrs[i]; j < ptrs[i] + sizes[i]; j++) {
+          freed[j] = true;
+        }
+      }
+
+      bool *freed_t = to_bitmap(t, total_size);
+      bool valid = true;
+      for (int j = 0; j < total_size; j++) {
+        valid = valid && (freed[j] == freed_t[j]);
+      }
+
+      ASSERT(valid);
+      free(freed_t);
+    }
+
+
+    block_aug_t *aug = (block_aug_t*)t->root->augmented;
+    uint64_t max_size = aug->max_size;
+
+    // Generate some pointers to free space and ensure that they are free
+    for (int p = 0; p < 10; p++) {
+      uint64_t ptr;
+      uint64_t size = rand() % max_size;
+      rb_get_free_ptr(t, size, &ptr);
+      bool valid = true;
+      for (int i = ptr; i < ptr + size; i++) {
+        valid = valid && freed[i];
+      }
+      ASSERT(valid);
+      ASSERT(validate_max_size(t->root));
+    }
+
+    free(ptrs);
+    free(sizes);
+    free(freed);
+    rb_free(t);
+  }
+
   return true;
 }
 
-bool test_rbtree_files_randomized() {
-  uint64_t total_size = 1000;
-  rb_tree *t = create_block_file_rbtree(total_size);
+bool test_get_subdirectories() {
+  uint64_t ptrs[3] = {0x1000, 0x2000, 0x3000};
+  const char *names[3] = {"testing1","testing2","testing3"};
 
-  bool *freed = malloc(total_size*sizeof(bool));
-  for (int i = 0; i < total_size; i++) {
-    freed[i] = true;
+  // Allocate for ptrs, names, commas, and null terminator
+  size_t size = 3*sizeof(uint64_t) + strlen(names[0]) + strlen(names[1]) + strlen(names[2]) + 3 + 1;
+  char *data = malloc(size);
+  size_t off = 0;
+  for (int i = 0; i < 3; i++){
+    memcpy(data + off, &ptrs[i], sizeof(uint64_t));
+    off += sizeof(uint64_t);
+    size_t len = strlen(names[i]);
+    memcpy(data + off, names[i], len); 
+    off += len;
+    if (i < 2) {
+      data[off++] = ',';
+    }
   }
 
-  for (int i = 0; i < 100; i++) {
-    int64_t r1 = rand() % total_size;
-    int64_t r2 = rand() % total_size;
-    while (abs(r2 - r1) < 4) {
-      r2 = rand() % total_size;
-    }
-    if (r1 > r2) {
-      int64_t tmp = r2;
-      r2 = r1;
-      r1 = tmp;
-    }
+  data[off] = '\0';
 
-    printf("r1 = %li, r2 = %li\n", r1, r2);
+  uint64_t *inode_numbers;
+  char **dirs = get_subdirectories(data, size, &inode_numbers);
 
-    uint64_t ptr = r1;
-    uint64_t size = r2 - r1;
-
-    for (int j = r1; j < r2; j++) {
-      freed[j] = false;
-    }
-
-    rb_malloc(t, ptr, size);
+  uint64_t num_dirs = 0;
+  while (dirs[num_dirs]) {
+    num_dirs++;
   }
+
+  ASSERT(num_dirs == 3);
+
+  for (int i = 0; i < 3; i++) {
+    ASSERT(inode_numbers[i] == ptrs[i]);
+    ASSERT(strcmp(dirs[i], names[i]) == 0);
+  }
+
+  free(inode_numbers);
+  free(dirs);
+  free(data);
+
+  return true;
+}
+
+void print_storage(char **storage, int num_blocks, int block_size) {
+  for (int k = 0; k < num_blocks; k++) {
+    for (int i = 0; i < block_size; i++) {
+      printf("%i ", storage[k][i]);
+    } printf("\n");
+  }
+}
+
+bool test_create_file() {
+  rb_tree *t;
+  char **storage = init_filesystem(&t);
 
   print_tree(t);
 
-  for (int j = 0; j < total_size; j++) {
-    printf("freed = %i\n", freed[j]);
-  }
+  uint64_t node1_ptr = make_directory(t, storage, ROOT_NODE,  "testing1");
+  uint64_t node2_ptr = make_directory(t, storage, node1_ptr, "testing2");
+  uint64_t node3_ptr = make_directory(t, storage, ROOT_NODE,  "testing3");
+
+  inode *node1 = read_inode(storage, node1_ptr);
+  inode *node3 = read_inode(storage, node3_ptr);
+  
+  print_tree(t);
+
+  inode *root = read_inode(storage, ROOT_NODE);
+  char *content = read_inode_content(storage, root);
+
+  uint64_t *inode_numbers;
+  char **subdirs = get_subdirectories(content, root->size, &inode_numbers);
+  ASSERT(strcmp(subdirs[0], "testing1") == 0);
+  ASSERT(strcmp(subdirs[1], "testing3") == 0);
+
+
+  ASSERT(inodes_equal(read_inode(storage, inode_numbers[0]), node1), "Failed node comparison.");
+  ASSERT(inodes_equal(read_inode(storage, inode_numbers[1]), node3), "Failed node comparison.");
+
+  content = read_inode_content(storage, node1);
+  subdirs = get_subdirectories(content, node1->size, &inode_numbers);
+  ASSERT(strcmp(subdirs[0], "testing2") == 0);
+
+  free(inode_numbers);
+  free(content);
+  free(subdirs);
+
+  free(root);
+  free(node1);
+  free(node3);
 
   rb_free(t);
+  free(storage);
+
   return true;
-};
+}
+
+bool test_find_inode() {
+  rb_tree *t;
+  char **storage = init_filesystem(&t);
+
+  uint64_t node1_ptr = make_directory(t, storage, ROOT_NODE,  "testing1");
+  uint64_t node2_ptr = make_directory(t, storage, node1_ptr, "testing2");
+  uint64_t node3_ptr = make_directory(t, storage, ROOT_NODE,  "testing3");
+  char *success = "success";
+  uint64_t node4_ptr = make_file(t, storage, node2_ptr,  "target", success, strlen(success));
+
+  uint64_t node_ptr;
+  inode *target = find_inode(storage, "/testing1/testing2/target", &node_ptr);
+  char *content = read_inode_content(storage, target);
+
+  ASSERT(strcmp(content, success) == 0);
+
+  rb_free(t);
+  free(storage);
+
+  return true;
+}
+
 
 static const char *_GREEN = "\033[1;32m";
 static const char *_RED   = "\033[1;31m";
@@ -698,23 +1257,34 @@ int main(int argc, char *argv[]) {
     test_names = &argv[1];
   }
 
-  //ADD_TEST(test_serialize_tree);
-  //ADD_TEST(test_find_node);
+  // Miscellaneous tests
+  ADD_TEST(test_remove_element);
+  ADD_TEST(test_split_string);
 
-  //ADD_TEST(test_serialize_inode);
-  //ADD_TEST(test_get_inode_data);
-  //ADD_TEST(test_files);
+  // Storgae IO tests
+  ADD_TEST(test_read_data_offset_basic);
+  ADD_TEST(test_read_data_offset);
+  ADD_TEST(test_path_first_last);
+  ADD_TEST(test_write_data_offset);
   
-  //ADD_TEST(test_rbtree_basic);
-  //ADD_TEST(test_rbtree_sorted_order);
-  //ADD_TEST(test_rbtree_stress);
-  //ADD_TEST(test_rbtree_delete_randomized);
-  //ADD_TEST(test_rbtree_successor_predecessor);
-  //ADD_TEST(test_rbtree_augmented_max_size);
-  //ADD_TEST(test_rbtree_augmented_randomized);
+  // rbtree basics
+  ADD_TEST(test_rbtree_basic);
+  ADD_TEST(test_rbtree_sorted_order);
+  ADD_TEST(test_rbtree_stress);
+  ADD_TEST(test_rbtree_delete_randomized);
+  ADD_TEST(test_rbtree_successor_predecessor);
+  ADD_TEST(test_rbtree_augmented_max_size);
 
+  // rbtree filesystem allocation/free
+  ADD_TEST(test_rbtree_malloc_randomized);
+  ADD_TEST(test_rbtree_mfree_basic);
+  ADD_TEST(test_rbtree_mfree_randomized);
   ADD_TEST(test_rbtree_free_ptr);
-  ADD_TEST(test_rbtree_files_randomized);
+
+  // Directory traversal
+  ADD_TEST(test_get_subdirectories);
+  ADD_TEST(test_create_file);
+  ADD_TEST(test_find_inode);
 
   if (tests.size == 0) {
     printf("No tests to run.\n");

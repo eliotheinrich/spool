@@ -215,7 +215,6 @@ static rb_node* minimum(rb_node *x) {
   return x;
 }
 
-/* Helper: replace one subtree with another */
 static void transplant(rb_tree *t, rb_node *u, rb_node *v) {
   if (!u->parent) {
     t->root = v;
@@ -224,7 +223,14 @@ static void transplant(rb_tree *t, rb_node *u, rb_node *v) {
   } else {
     u->parent->right = v;
   }
-  if (v) v->parent = u->parent;
+
+  if (v) {
+    v->parent = u->parent;
+  }
+
+  if (t->update_aug) {
+    update_augmented_upwards(u->parent, t);
+  }
 }
 
 static void fix_delete(rb_tree *t, rb_node *x, rb_node *x_parent) {
@@ -311,7 +317,10 @@ static void fix_delete(rb_tree *t, rb_node *x, rb_node *x_parent) {
       }
     }
   }
-  if (x) x->color = BLACK;
+
+  if (x) {
+    x->color = BLACK;
+  }
 }
 
 bool rb_delete(rb_tree *t, const void *key) {
@@ -332,6 +341,7 @@ bool rb_delete(rb_tree *t, const void *key) {
   }
 
   if (!z) {
+    printf("Returning early\n");
     return false; 
   }
 
@@ -379,6 +389,7 @@ bool rb_delete(rb_tree *t, const void *key) {
     fix_delete(t, x, first_aug_node);
   }
 
+  free(z->augmented);
   free(z->data);
   free(z);
   t->size--;
@@ -494,7 +505,7 @@ void update_max_size(rb_node *n) {
   int right_max = n->right ? ((block_aug_t *)n->right->augmented)->max_size : 0;
 
   aug->max_size = blk->size;
-  if (left_max > aug->max_size) {
+  if (left_max >= aug->max_size) {
     aug->max_size = left_max;
   }
   if (right_max > aug->max_size) {
@@ -512,6 +523,7 @@ rb_tree *create_block_file_rbtree(uint64_t total_size) {
   uint64_t *ptr = malloc(sizeof(uint64_t));
   *ptr = total_size;
   rb_tree *t = rb_create(block_less_by_ptr, update_max_size, ptr);
+  rb_mfree(t, 0, total_size);
   return t;
 }
 
@@ -521,6 +533,7 @@ int rbtree_file_insert(rb_tree *t, uint64_t ptr, uint64_t size) {
   block->size = size;
   block_aug_t *aug = malloc(sizeof(block_aug_t));
   aug->max_size = size;
+
   return rb_insert(t, block, aug);
 }
 
@@ -545,35 +558,39 @@ void read_node_data(rb_node *node, uint64_t *ptr, uint64_t *size, uint64_t *max_
 
 int rb_get_free_ptr(rb_tree* t, uint64_t size, uint64_t *ptr) {
   rb_node *node = t->root;
-  uint64_t *node_ptr = malloc(sizeof(uint64_t));;
-  uint64_t *node_size = malloc(sizeof(uint64_t));
-  uint64_t *max_size = malloc(sizeof(uint64_t));
+  uint64_t node_ptr = malloc(sizeof(uint64_t));;
+  uint64_t node_size = malloc(sizeof(uint64_t));
+  uint64_t max_size = malloc(sizeof(uint64_t));
 
-  read_node_data(node, node_ptr, node_size, max_size);
-  if (*max_size < size) {
+  read_node_data(node, &node_ptr, &node_size, &max_size);
+  if (max_size < size) {
     return -1;
   }
 
   bool keep_going = true;
   while (keep_going) {
-    if (node->left && (((block_aug_t*)node->left->augmented)->max_size >= *max_size)) {
+    if (node->left && (((block_aug_t*)node->left->augmented)->max_size >= max_size)) {
       node = node->left;
-    } else if (node->right && (((block_aug_t*)node->right->augmented)->max_size >= *max_size)) {
+    } else if (node->right && (((block_aug_t*)node->right->augmented)->max_size >= max_size)) {
       node = node->right;
     } else {
       // This is the terminal node
       keep_going = false;
     }
 
-    read_node_data(node, node_ptr, node_size, max_size);
+    read_node_data(node, &node_ptr, &node_size, &max_size);
   }
 
-  *ptr = *node_ptr;
+  *ptr = node_ptr;
   return 0;
 }
 
 // Frees the rbtree representation
 int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
+  if (size == 0) {
+    return 0;
+  }
+
   uint64_t total_size = *((uint64_t*)t->metadata);
   // Out of bounds
   if (ptr + size > total_size) {
@@ -584,34 +601,65 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
   block->ptr = ptr;
   block->size = size;
 
+  // Deal with block starting at ptr
+  block_t *b = (block_t*)rb_find(t, block);
+  if (b) {
+    uint64_t b_ptr = b->ptr;
+    uint64_t b_size = b->size;
+    rbtree_file_delete(t, b_ptr, b_size);
+
+    if (b_size > size) {
+      size = b_size;
+    } 
+  }
+
   block_t *prev = (block_t*)rb_next_smaller(t, block);
   block_t *next = (block_t*)rb_next_larger(t, block);
-  free(block);
 
   // interval lies entirely within an existing free block
   // nothing needs to be done
   if (prev && prev->ptr + prev->size > ptr + size) {
+    free(block);
     return 0;
   }
 
   // Address overlaps with neighboring sites
-  if (prev && prev->ptr + prev->size >= ptr - 1) {
+  // -----a*******b-------
+  // --c****d-------------
+  while (prev && prev->ptr + prev->size >= ptr) {
+    uint64_t a = ptr;
+    uint64_t c = prev->ptr;
     ptr = prev->ptr;
-    size += prev->size;
+    size += a - c;
     rbtree_file_delete(t, prev->ptr, prev->size);
+    prev = (block_t*)rb_next_smaller(t, block);
   }
 
-  if (next && ptr + size >= next->ptr - 1) {
-    size += next->size;
+  while (next && ptr + size >= next->ptr) {
+    // -----a********b-------
+    // ----------c*d---------
+    // or 
+    // ----------c*****d-----
+    uint64_t d = next->ptr + next->size;
+    uint64_t b = ptr + size;
+    if (d > b) {
+      size += d - b;
+    }
     rbtree_file_delete(t, next->ptr, next->size);
+    next = (block_t*)rb_next_larger(t, block);
   }
   
   // At this point, there are no overlaps. Insert and return
   rbtree_file_insert(t, ptr, size);
+  free(block);
   return 0;
 }
 
 int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
+  if (size == 0) {
+    return 0;
+  }
+
   uint64_t total_size = *((uint64_t*)t->metadata);
   // Out of bounds
   if (ptr + size > total_size) {
@@ -624,44 +672,99 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
 
   block_t *prev = (block_t*)rb_next_smaller(t, block);
   block_t *next = (block_t*)rb_next_larger(t, block);
-  free(block);
+
+  // Deal with block starting at ptr
+  block_t *b = (block_t*) rb_find(t, block);
+  if (b) {
+    uint64_t b_ptr = b->ptr;
+    uint64_t b_size = b->size;
+    rbtree_file_delete(t, b_ptr, b_size);
+
+    if (b_size > size) {
+      rbtree_file_insert(t, b_ptr + size, b_size - size);
+    }
+  }
 
   // interval lies entirely within an existing free block
-  if (prev && prev->ptr + prev->size > ptr + size) {
-  // ---a******b------
-  // -c***********d---
+  while (prev && prev->ptr + prev->size > ptr + size) {
+    // ---a******b------
+    // -c***********d---
     uint64_t a = ptr;
     uint64_t b = ptr + size;
     uint64_t c = prev->ptr;
     uint64_t d = prev->ptr + prev->size;
+
     rbtree_file_delete(t, prev->ptr, prev->size);
     rbtree_file_insert(t, c, a - c);
     rbtree_file_insert(t, b, d - b);
     
+    free(block);
     return 0;
   }
 
   // ---a******b------
   // -c***d-----------
-  if (prev && prev->ptr + prev->size >= ptr) {
+  while (prev && prev->ptr + prev->size > ptr) {
     uint64_t a = ptr;
-    uint64_t b = ptr + size;
     uint64_t c = prev->ptr;
-    uint64_t d = prev->ptr + prev->size;
     rbtree_file_delete(t, prev->ptr, prev->size);
     rbtree_file_insert(t, c, a - c);
+    prev = (block_t*)rb_next_smaller(t, block);
   }
 
   // ---a******b------
-  // --------c****d---
-  if (next && ptr + size >= next->ptr) {
-    uint64_t a = ptr;
+  // -----c******d----
+  // or 
+  // -----c**d--------
+  while (next && ptr + size > next->ptr) {
     uint64_t b = ptr + size;
-    uint64_t c = next->ptr;
     uint64_t d = next->ptr + next->size;
     rbtree_file_delete(t, next->ptr, next->size);
-    rbtree_file_insert(t, c, d - b);
+    if (d > b) {
+      rbtree_file_insert(t, b, d - b);
+    }
+    next = (block_t*)rb_next_larger(t, block);
   }
   
+  free(block);
   return 0;
 }
+
+void print_tree_recursive(rb_node *n, int depth) {
+  if (!n) {
+    return;
+  }
+
+  // Indentation for current depth
+  for (int i = 0; i < depth; i++) {
+    printf("  ");
+  }
+
+  // Print current node info
+  block_t *blk = (block_t *)n->data;
+  block_aug_t *aug = (block_aug_t *)n->augmented;
+  char color = n->color == RED ? 'R' : 'B';
+
+  printf("[%li, %li] (color=%c", blk->ptr, blk->size, color);
+  if (aug) {
+    printf(", max_size=%li", aug->max_size);
+  }
+  printf(")\n");
+
+  // Print right subtree first (so it appears on top when printed)
+  print_tree_recursive(n->right, depth + 1);
+
+  // Print left subtree
+  print_tree_recursive(n->left, depth + 1);
+}
+
+void print_tree(rb_tree *t) {
+  if (!t) {
+    return;
+  }
+  printf("RB-tree (size=%zu):\n", t->size);
+  print_tree_recursive(t->root, 0);
+}
+
+
+

@@ -11,7 +11,10 @@ RBTREE_SRC = $(SRC_DIR)/rbtree.c
 NODE_SRC = $(SRC_DIR)/node.c
 TEST_SRC = $(TEST_DIR)/tests.c
 
-MAIN_OBJ = $(MAIN_SRC:.c=.o) $(NODE_SRC:.c=.o)
+MPI_OBJ = $(MPI_SRC:.c=.o)
+
+
+MAIN_OBJ = $(MAIN_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o)
 TEST_OBJ = $(TEST_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o)
 
 .PHONY: all clean
@@ -30,5 +33,5 @@ tests: $(TEST_OBJ)
 	$(CC) $(CFLAGS) $(FUSE_FLAGS) -c $< -o $@
 
 clean:
-	rm -f $(SRC_DIR)/*.o $(TEST_DIR)/*.o main tests rbtree
+	rm -f $(SRC_DIR)/*.o $(TEST_DIR)/*.o main tests
 
