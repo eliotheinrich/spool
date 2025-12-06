@@ -558,9 +558,7 @@ void read_node_data(rb_node *node, uint64_t *ptr, uint64_t *size, uint64_t *max_
 
 int rb_get_free_ptr(rb_tree* t, uint64_t size, uint64_t *ptr) {
   rb_node *node = t->root;
-  uint64_t node_ptr = malloc(sizeof(uint64_t));;
-  uint64_t node_size = malloc(sizeof(uint64_t));
-  uint64_t max_size = malloc(sizeof(uint64_t));
+  uint64_t node_ptr, node_size, max_size;
 
   read_node_data(node, &node_ptr, &node_size, &max_size);
   if (max_size < size) {
@@ -766,5 +764,125 @@ void print_tree(rb_tree *t) {
   print_tree_recursive(t->root, 0);
 }
 
+static size_t count_nodes(rb_node *n) {
+  if (!n) {
+    return 0;
+  }
+  return 1 + count_nodes(n->left) + count_nodes(n->right);
+}
 
+// Helper: Pre-order serialize
+static void serialize_node(rb_node *n, char **buffer_ptr) {
+  if (!n) {
+    return;
+  }
+
+  block_t *b = (block_t*)n->data;
+  memcpy(*buffer_ptr, &b->ptr, sizeof(uint64_t));
+  *buffer_ptr += sizeof(uint64_t);
+
+  memcpy(*buffer_ptr, &b->size, sizeof(uint64_t));
+  *buffer_ptr += sizeof(uint64_t);
+
+  **buffer_ptr = (char)n->color;
+  *buffer_ptr += sizeof(char);
+
+  serialize_node(n->left, buffer_ptr);
+  serialize_node(n->right, buffer_ptr);
+}
+
+// Helper: Pre-order deserialize
+static rb_node* deserialize_node(char **buffer_ptr, size_t *offset, size_t total_size, rb_tree *t) {
+  size_t node_size = sizeof(uint64_t)*2 + sizeof(char);
+  if (*offset + node_size > total_size) {
+    return NULL;
+  }
+
+  block_t *b = malloc(sizeof(block_t));
+  memcpy(&b->ptr, *buffer_ptr, sizeof(uint64_t));
+  *buffer_ptr += sizeof(uint64_t);
+
+  memcpy(&b->size, *buffer_ptr, sizeof(uint64_t));
+  *buffer_ptr += sizeof(uint64_t);
+
+  char color = **buffer_ptr;
+  *buffer_ptr += sizeof(char);
+  *offset += node_size;
+
+  rb_node *n = malloc(sizeof(rb_node));
+  n->data = b;
+  n->augmented = malloc(sizeof(block_aug_t));
+  ((block_aug_t*)n->augmented)->max_size = b->size;
+  n->color = (rb_color)color;
+  n->left = NULL;
+  n->right = NULL;
+  n->parent = NULL;
+
+  n->left = deserialize_node(buffer_ptr, offset, total_size, t);
+  if (n->left) {
+    n->left->parent = n;
+  }
+
+  n->right = deserialize_node(buffer_ptr, offset, total_size, t);
+  if (n->right) {
+    n->right->parent = n;
+  }
+
+  t->update_aug(n);
+  t->size++;
+  return n;
+}
+
+char *rb_serialize(rb_tree *t, size_t *out_size) {
+  if (!t) {
+    return NULL;
+  }
+
+  size_t count = count_nodes(t->root);
+  size_t buf_size = sizeof(uint64_t) + count * (sizeof(uint64_t)*2 + sizeof(char));
+
+  char *buf = malloc(buf_size);
+
+  char *ptr = buf;
+
+  // Serialize metadata first
+  memcpy(buf, t->metadata, sizeof(uint64_t));
+  ptr += sizeof(uint64_t);
+
+  // Serialize nodes
+  serialize_node(t->root, &ptr);
+
+  if (out_size) {
+    *out_size = buf_size;
+  }
+  return buf;
+}
+
+int rb_deserialize(rb_tree *t, char *buffer, size_t size, rb_less_fn less, rb_augment_fn update_aug) {
+  if (!t || !buffer) {
+    printf("No t or buffer. Failed.\n");
+    return IFAILED;
+  }
+
+  char *ptr = buffer;
+  size_t offset = 0;
+
+  t->metadata = malloc(sizeof(uint64_t));
+  memcpy(t->metadata, ptr, sizeof(uint64_t));
+  ptr += sizeof(uint64_t);
+
+  t->less = less;
+  t->update_aug = update_aug;
+  t->root = NULL;
+  t->size = 0;
+
+  t->root = deserialize_node(&ptr, &offset, size - sizeof(uint64_t), t);
+  if (!t->root) {
+    printf("No root. Failed.\n");
+    return IFAILED;
+  }
+
+  printf("Success = %i\n", ISUCCESS);
+  return ISUCCESS;
+}
 

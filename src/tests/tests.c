@@ -10,6 +10,10 @@
 #include "rbtree.h"
 #include "node.h"
 
+static const uint32_t BLOCK_SIZE = 1024;
+static const uint32_t NUM_BLOCKS = 20;
+
+
 #define GET_MACRO(_1, _2, NAME, ...) NAME
 #define ASSERT(...) GET_MACRO(__VA_ARGS__, ASSERT_TWO_ARGS, ASSERT_ONE_ARG)(__VA_ARGS__)
 
@@ -285,10 +289,11 @@ bool test_split_string() {
 
 bool test_read_data_offset_basic() {
   unsigned seed = get_seed();
-  printf("seed = %i\n", seed);
   srand(seed);
 
-  char **storage = malloc_blocks(NUM_BLOCKS, BLOCK_SIZE);
+  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  char **storage = handle.storage; // alias
+
   uint64_t block0 = 0;
   uint64_t offset0 = 4;
   uint64_t ptr0 = offset0 + block0*BLOCK_SIZE;
@@ -343,14 +348,14 @@ bool test_read_data_offset_basic() {
   uint64_t offset = rand() % size;
   offset = 0;
   char *buffer = malloc(size - offset);
-  read_data_offset(storage, ptr0, size - offset, buffer, offset);
+  read_data_offset(handle, ptr0, size - offset, buffer, offset);
 
   for (int i = 0; i < size - offset; i++) {
     ASSERT(buffer[i] == (char) i + offset);
   }
 
   free(buffer);
-  free(storage);
+  free_handle(handle);
   return true;
 }
 
@@ -359,8 +364,7 @@ bool test_read_data_offset() {
     unsigned seed = get_seed();
     srand(seed);
 
-    rb_tree *t;
-    char **storage = init_filesystem(&t);
+    fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
 
     int n1 = 2*BLOCK_SIZE;
     int n2 = 4*BLOCK_SIZE;
@@ -377,13 +381,13 @@ bool test_read_data_offset() {
       data3[i + n1] = data2[i];
     }
 
-    uint64_t node_ptr = make_file(t, storage, ROOT_NODE, "file", data1, n1);
-    append_to_inode(t, storage, data2, n2, node_ptr);
+    uint64_t node_ptr = make_file(handle, ROOT_NODE, "file", data1, n1);
+    append_to_inode(handle, data2, n2, node_ptr);
 
-    inode *node = read_inode(storage, node_ptr);
+    inode *node = read_inode(handle, node_ptr);
     uint64_t offset = rand() % n1;
     char *buffer = malloc(node->size - offset);
-    read_data_offset(storage, node->ptr, node->size - offset, buffer, offset);
+    read_data_offset(handle, node->ptr, node->size - offset, buffer, offset);
 
     for (int i = 0; i < n1 - offset; i++) {
       ASSERT(data1[i + offset] == buffer[i]);
@@ -393,8 +397,7 @@ bool test_read_data_offset() {
     free(data2);
     free(data3);
     free(node);
-    rb_free(t);
-    free(storage);
+    free_handle(handle);
   }
   return true;
 }
@@ -404,8 +407,7 @@ bool test_write_data_offset() {
     unsigned seed = get_seed();
     srand(seed);
 
-    rb_tree *t;
-    char **storage = init_filesystem(&t);
+    fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
 
     int n1 = 2*BLOCK_SIZE;
     int n2 = 4*BLOCK_SIZE;
@@ -415,18 +417,18 @@ bool test_write_data_offset() {
 
     uint64_t ptr1 = 0;
     uint64_t ptr2 = 3*BLOCK_SIZE + 24;
-    rb_malloc(t, ptr1, n1);
-    write_chunk(storage, ptr1, n1, data1);
-    memcpy(storage[ptr1/BLOCK_SIZE] + ptr1%BLOCK_SIZE, &ptr2, sizeof(uint64_t));
-    rb_malloc(t, ptr2, n2);
-    write_chunk(storage, ptr2, n2, data2);
-    write_to_data(storage, ptr1, n1, data1, n1);
+    rb_malloc(handle.t, ptr1, n1);
+    write_chunk(handle, ptr1, n1, data1);
+    memcpy(handle.storage[ptr1/BLOCK_SIZE] + ptr1%BLOCK_SIZE, &ptr2, sizeof(uint64_t));
+    rb_malloc(handle.t, ptr2, n2);
+    write_chunk(handle, ptr2, n2, data2);
+    write_to_data(handle, ptr1, n1, data1, n1);
 
     int size = n1 + n2;
 
     uint64_t offset = n1;
     char *buffer = malloc(size - offset);
-    read_data_offset(storage, ptr1, size - offset, buffer, offset);
+    read_data_offset(handle, ptr1, size - offset, buffer, offset);
 
     for (int i = 0; i < size - offset; i++) {
       ASSERT(data1[i] == buffer[i]);
@@ -435,7 +437,7 @@ bool test_write_data_offset() {
     free(data1);
     free(data2);
     free(data3);
-    free(storage);
+    free_handle(handle);
   }
   return true;
 }
@@ -807,6 +809,76 @@ bool test_rbtree_augmented_max_size() {
   return true;
 }
 
+// Helper to compare two trees recursively
+bool compare_nodes(rb_node *a, rb_node *b) {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+
+  block_t *ba = (block_t*)a->data;
+  block_t *bb = (block_t*)b->data;
+
+  if (ba->ptr != bb->ptr || ba->size != bb->size) {
+    return false;
+  }
+
+  block_aug_t *aug_a = (block_aug_t*)a->augmented;
+  block_aug_t *aug_b = (block_aug_t*)b->augmented;
+
+  if (aug_a->max_size != aug_b->max_size) {
+    return false;
+  }
+
+  if (a->color != b->color) {
+    return false;
+  }
+
+  return compare_nodes(a->left, b->left) && compare_nodes(a->right, b->right);
+}
+
+bool test_rbtree_serialize() {
+  // Create first tree
+  rb_tree *t1 = create_block_file_rbtree(1024);
+  uint64_t* metadata = malloc(sizeof(uint64_t)); 
+  *metadata = 42;
+  t1->metadata = (void*)metadata;  
+
+  // Allocate some blocks
+  rb_malloc(t1, 0, 256);
+  rb_malloc(t1, 256, 128);
+  rb_malloc(t1, 384, 64);
+
+  // Serialize
+  size_t buf_size;
+  char *buffer = rb_serialize(t1, &buf_size);
+  if (!buffer) {
+    rb_free(t1);
+    return false;
+  }
+
+  // Deserialize into new tree
+  rb_tree *t2 = create_block_file_rbtree(1024);
+  int res = rb_deserialize(t2, buffer, buf_size, t1->less, t1->update_aug);
+  if (res != ISUCCESS) {
+    free(buffer);
+    rb_free(t1);
+    rb_free(t2);
+    return false;
+  }
+
+  // Compare both trees
+  bool equal = compare_nodes(t1->root, t2->root) && *(uint64_t*)t1->metadata == *(uint64_t*)t2->metadata;
+
+  free(buffer);
+  rb_free(t1);
+  rb_free(t2);
+
+  return equal;
+}
+
 int check_max_size(rb_node *n) {
   if (!n) {
     return 0;
@@ -1171,22 +1243,17 @@ void print_storage(char **storage, int num_blocks, int block_size) {
 }
 
 bool test_create_file() {
-  rb_tree *t;
-  char **storage = init_filesystem(&t);
+  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
 
-  print_tree(t);
+  uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
+  uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
+  uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
 
-  uint64_t node1_ptr = make_directory(t, storage, ROOT_NODE,  "testing1");
-  uint64_t node2_ptr = make_directory(t, storage, node1_ptr, "testing2");
-  uint64_t node3_ptr = make_directory(t, storage, ROOT_NODE,  "testing3");
+  inode *node1 = read_inode(handle, node1_ptr);
+  inode *node3 = read_inode(handle, node3_ptr);
 
-  inode *node1 = read_inode(storage, node1_ptr);
-  inode *node3 = read_inode(storage, node3_ptr);
-  
-  print_tree(t);
-
-  inode *root = read_inode(storage, ROOT_NODE);
-  char *content = read_inode_content(storage, root);
+  inode *root = read_inode(handle, ROOT_NODE);
+  char *content = read_inode_content(handle, root);
 
   uint64_t *inode_numbers;
   char **subdirs = get_subdirectories(content, root->size, &inode_numbers);
@@ -1194,10 +1261,10 @@ bool test_create_file() {
   ASSERT(strcmp(subdirs[1], "testing3") == 0);
 
 
-  ASSERT(inodes_equal(read_inode(storage, inode_numbers[0]), node1), "Failed node comparison.");
-  ASSERT(inodes_equal(read_inode(storage, inode_numbers[1]), node3), "Failed node comparison.");
+  ASSERT(inodes_equal(read_inode(handle, inode_numbers[0]), node1), "Failed node comparison.");
+  ASSERT(inodes_equal(read_inode(handle, inode_numbers[1]), node3), "Failed node comparison.");
 
-  content = read_inode_content(storage, node1);
+  content = read_inode_content(handle, node1);
   subdirs = get_subdirectories(content, node1->size, &inode_numbers);
   ASSERT(strcmp(subdirs[0], "testing2") == 0);
 
@@ -1209,30 +1276,27 @@ bool test_create_file() {
   free(node1);
   free(node3);
 
-  rb_free(t);
-  free(storage);
+  free_handle(handle);
 
   return true;
 }
 
 bool test_find_inode() {
-  rb_tree *t;
-  char **storage = init_filesystem(&t);
+  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
 
-  uint64_t node1_ptr = make_directory(t, storage, ROOT_NODE,  "testing1");
-  uint64_t node2_ptr = make_directory(t, storage, node1_ptr, "testing2");
-  uint64_t node3_ptr = make_directory(t, storage, ROOT_NODE,  "testing3");
+  uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
+  uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
+  uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
   char *success = "success";
-  uint64_t node4_ptr = make_file(t, storage, node2_ptr,  "target", success, strlen(success));
+  uint64_t node4_ptr = make_file(handle, node2_ptr,  "target", success, strlen(success));
 
   uint64_t node_ptr;
-  inode *target = find_inode(storage, "/testing1/testing2/target", &node_ptr);
-  char *content = read_inode_content(storage, target);
+  inode *target = find_inode(handle, "/testing1/testing2/target", &node_ptr);
+  char *content = read_inode_content(handle, target);
 
   ASSERT(strcmp(content, success) == 0);
 
-  rb_free(t);
-  free(storage);
+  free_handle(handle);
 
   return true;
 }
@@ -1274,6 +1338,7 @@ int main(int argc, char *argv[]) {
   ADD_TEST(test_rbtree_delete_randomized);
   ADD_TEST(test_rbtree_successor_predecessor);
   ADD_TEST(test_rbtree_augmented_max_size);
+  ADD_TEST(test_rbtree_serialize);
 
   // rbtree filesystem allocation/free
   ADD_TEST(test_rbtree_malloc_randomized);

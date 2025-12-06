@@ -74,6 +74,8 @@ void update_augmented_upwards(rb_node *n, rb_tree *t);
 void print_tree_recursive(rb_node *n, int depth);
 void print_tree(rb_tree *t);
 
+char *rb_serialize(rb_tree *t, size_t *out_size);
+int rb_deserialize(rb_tree *t, char *buffer, size_t size, rb_less_fn less, rb_augment_fn update_aug);
 
 #endif /* RBTREE_H */
 

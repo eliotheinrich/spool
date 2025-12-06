@@ -4,16 +4,19 @@
 #include <errno.h>
 #include <fuse3/fuse.h>
 #include <string.h>
-#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "node.h"
 
-char **storage;
-rb_tree *t;
+static const uint32_t BLOCK_SIZE = 1024;
+static const uint32_t NUM_BLOCKS = 1;
+
+fs_handle handle;
 
 static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -21,11 +24,14 @@ static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler, off_
   filler(data, ".", NULL, 0, 0);
   filler(data, "..", NULL, 0, 0);
 
-  char *content = read_inode_content(storage, node);
+  char *content = read_inode_content(handle, node);
   uint64_t *inode_numbers = NULL;
   char **subdirs = get_subdirectories(content, node->size, &inode_numbers);
 
+  printf("Called fs_readdir\n");
+
   if (subdirs) {
+    printf("Found subdirs\n");
     char **p = subdirs;
     while (*p) {
       filler(data, *p, NULL, 0, 0);
@@ -46,14 +52,14 @@ static int fs_mkdir(const char *path, mode_t mode) {
   char *filename = path_last(path, &rest);
   
   uint64_t parent_ptr;
-  inode *parent = find_inode(storage, rest, &parent_ptr);
+  inode *parent = find_inode(handle, rest, &parent_ptr);
   if (!parent || !(parent->mode & FILETYPE_DIR)) {
     free(parent);
     free(filename);
     return -ENOENT;
   }
 
-  uint64_t node_ptr = make_directory(t, storage, parent_ptr, filename);
+  make_directory(handle, parent_ptr, filename);
 
   free(parent);
   free(filename);
@@ -63,7 +69,7 @@ static int fs_mkdir(const char *path, mode_t mode) {
 
 static int fs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -83,7 +89,7 @@ static int fs_getattr(const char *path, struct stat *st, struct fuse_file_info *
 
 static int fs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
 
   if (!node) {
     return -ENOENT;
@@ -109,12 +115,12 @@ static int fs_write(const char *path, const char *buf, size_t size, off_t offset
 
   // overwrite existing data
   if (to_write > 0) {
-    write_to_data(storage, node->ptr, to_write, buf, offset);
+    write_to_data(handle, node->ptr, to_write, buf, offset);
   }
 
   // append new data
   if (append_size > 0) {
-    append_to_inode(t, storage, buf + to_write, append_size, node_ptr);
+    append_to_inode(handle, buf + to_write, append_size, node_ptr);
   }
 
   return size;
@@ -123,7 +129,7 @@ static int fs_write(const char *path, const char *buf, size_t size, off_t offset
 
 static int fs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -137,17 +143,17 @@ static int fs_truncate(const char *path, off_t size, struct fuse_file_info *fi) 
     //truncate_inode(storage, node_ptr, size);  // implement this
   } else if ((size_t)size > node->size) {
     // expand file: append zeros
-    append_to_inode(t, storage, NULL, size - node->size, node_ptr);
+    append_to_inode(handle, NULL, size - node->size, node_ptr);
   }
 
   node->size = size;
-  write_inode(storage, node, node_ptr);
+  write_inode(handle, node, node_ptr);
   return 0;
 }
 
 static int fs_open(const char *path, struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -163,7 +169,7 @@ static int fs_open(const char *path, struct fuse_file_info *fi) {
 
 static int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node || !(node->mode & FILETYPE_FILE)) {
     return -ENOENT;
   }
@@ -176,7 +182,7 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset, struc
     size = node->size - offset;
   }
 
-  read_data_offset(storage, node->ptr, node->size, buf, (uint64_t) offset);
+  read_data_offset(handle, node->ptr, node->size, buf, (uint64_t) offset);
   return size;
 }
 
@@ -185,7 +191,7 @@ static int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
   char *filename = path_last(path, &rest);
   
   uint64_t parent_ptr;
-  inode *parent = find_inode(storage, rest, &parent_ptr);
+  inode *parent = find_inode(handle, rest, &parent_ptr);
   if (!parent || !(parent->mode & FILETYPE_DIR)) {
     free(filename);
     free(parent);
@@ -194,14 +200,14 @@ static int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
   free(parent);
 
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (node) {
     free(filename);
     free(node);
     return -EEXIST;
   }
 
-  node_ptr = make_file(t, storage, parent_ptr, filename, NULL, 0);
+  node_ptr = make_file(handle, parent_ptr, filename, NULL, 0);
 
   free(filename);
   return 0;
@@ -217,7 +223,7 @@ static int fs_mknod(const char *path, mode_t mode, dev_t rdev) {
 
 static int fs_unlink(const char *path) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     free(node);
     return -ENOENT;
@@ -236,21 +242,21 @@ static int fs_unlink(const char *path) {
   free(node);
 
   char *rest;
-  char *filename = path_last(path, rest);
+  char *filename = path_last(path, &rest);
 
   uint64_t parent_ptr;
-  inode *parent = find_inode(storage, rest, &parent_ptr);
+  inode *parent = find_inode(handle, rest, &parent_ptr);
 
   if (!parent) {
     return -1;
   }
 
-  char *parent_content = read_inode_content(storage, parent);
+  char *parent_content = read_inode_content(handle, parent);
   char *removed;
   size_t out_size;
   remove_element(parent_content, parent->size, filename, &removed, &out_size);
-  replace_inode_content(storage, t, parent_ptr, removed, out_size);
-  remove_directory(storage, t, node_ptr);
+  replace_inode_content(handle, parent_ptr, removed, out_size);
+  remove_directory(handle, node_ptr);
 
   free(parent);
   free(parent_content);
@@ -263,7 +269,7 @@ static int fs_unlink(const char *path) {
 
 static int fs_rmdir(const char *path) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -286,7 +292,7 @@ static int fs_rmdir(const char *path) {
 
 static int fs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi) {
   uint64_t node_ptr;
-  inode *node = find_inode(storage, path, &node_ptr);
+  inode *node = find_inode(handle, path, &node_ptr);
   if (!node) {
     return -ENOENT;
   }
@@ -296,7 +302,7 @@ static int fs_utimens(const char *path, const struct timespec tv[2], struct fuse
 
   node->ctime = time(NULL);
 
-  write_inode(storage, node, node_ptr);
+  write_inode(handle, node, node_ptr);
 
   free(node);
 
@@ -318,12 +324,62 @@ struct fuse_operations fsops = {
   .utimens = fs_utimens,
 };
 
+void save_file(char *filename, char *buffer, size_t size) {
+  char path[2048];
+  snprintf(path, sizeof(path), "%s/%s", original_cwd, filename);
+  FILE *fp = fopen(path, "wb");  
+  if (fp) {
+    fwrite(buffer, 1, size, fp);
+    fclose(fp);
+  } 
+}
+
+void cleanup(int signum) {
+  if (rank == 0) {
+    size_t size;
+    char *buffer = rb_serialize(handle.t, &size);
+    save_file(RBTREE_FILENAME, buffer, size);
+    free(buffer);
+  }
+
+  exit(0);
+}
+
 int main(int argc, char **argv) {
-  storage = init_filesystem(&t);
+  if (!getcwd(original_cwd, sizeof(original_cwd))) {
+    perror("getcwd failed");
+    return 1;
+  }
 
-  int result = fuse_main(argc, argv, &fsops, NULL);
+  int provided;
+  MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-  rb_tree(t);
-  free(storage);
+  if (world_size != NUM_BLOCKS + 1) {
+    if (rank == 0) {
+      printf("This example requires %d MPI processes\n", NUM_BLOCKS + 1);
+    }
+    MPI_Finalize();
+    return 1;
+  }
+
+  if (provided != MPI_THREAD_MULTIPLE) {
+    printf("Requires multi-threaded MPI model.\n");
+    return 1;
+  }
+
+  handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  signal(SIGINT, cleanup);
+
+  int result;
+  if (rank == 0) {
+    result = fuse_main(argc, argv, &fsops, NULL);
+  } else {
+    result = handle_requests(handle);
+  }
+
+  free_handle(handle);
   return result;
 }
+
