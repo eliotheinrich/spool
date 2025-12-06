@@ -1,0 +1,9 @@
+**/*.o
+*.bin
+*.img
+
+hello
+main
+tests
+testing
+build
