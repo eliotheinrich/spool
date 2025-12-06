@@ -1,4 +1,5 @@
-#spool
+# spool
+
 This is a simple distributed filesystem written in pure C using FUSE, with multithreading from MPI and pthreads. When the program starts, `n` blocks of 
 size `BLOCK_SIZE` are stored on the parent filesystem. These blocks are each managed by an independently running MPI process. Free/allocated data is 
 tracked by an RB-tree on the master process, which can dispense pointers to vacant space when a new allocation is requested, or mark freed space as usable. 
