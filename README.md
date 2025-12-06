@@ -12,4 +12,4 @@ process, who assembles and returns it. Similar work is done for write operations
 Since the processes are managed using MPI, they can in principle be distributed amongst multiple machines, meaning this filesystem is distributed; the 
 filesystem visible to the user is a virtualized view over many blocks not necessarily stored locally.
 
-To build, just use `make`. You will need to install FUSE and MPI. Run with `mpirun -np 5 ./main ./hello`
+To build, just use `make main`. You will need to install FUSE and MPI. Run with `mpirun -np 5 ./main ./hello`. You can also run the unit tests with `make tests`, and then execute them with `mpirun -np 5 ./tests`.
