@@ -477,15 +477,15 @@ void rb_free(rb_tree *t) {
   free(t);
 }
 
-block_t *make_block(int ptr, int size, rb_node **out_node) {
-  block_t *blk = malloc(sizeof(block_t));
+chunk_t *make_block(int ptr, int size, rb_node **out_node) {
+  chunk_t *blk = malloc(sizeof(chunk_t));
   blk->ptr = ptr;
   blk->size = size;
 
   rb_node *node = malloc(sizeof(rb_node));
   node->data = blk;
-  node->augmented = malloc(sizeof(block_aug_t));
-  ((block_aug_t *)node->augmented)->max_size = size;
+  node->augmented = malloc(sizeof(chunk_aug_t));
+  ((chunk_aug_t *)node->augmented)->max_size = size;
   node->left = NULL;
   node->right = NULL;
   node->parent = NULL;
@@ -498,11 +498,11 @@ block_t *make_block(int ptr, int size, rb_node **out_node) {
 }
 
 void update_max_size(rb_node *n) {
-  block_t *blk = (block_t *)n->data;
-  block_aug_t *aug = (block_aug_t *)n->augmented;
+  chunk_t *blk = (chunk_t *)n->data;
+  chunk_aug_t *aug = (chunk_aug_t *)n->augmented;
 
-  int left_max = n->left ? ((block_aug_t *)n->left->augmented)->max_size : 0;
-  int right_max = n->right ? ((block_aug_t *)n->right->augmented)->max_size : 0;
+  int left_max = n->left ? ((chunk_aug_t *)n->left->augmented)->max_size : 0;
+  int right_max = n->right ? ((chunk_aug_t *)n->right->augmented)->max_size : 0;
 
   aug->max_size = blk->size;
   if (left_max >= aug->max_size) {
@@ -514,8 +514,8 @@ void update_max_size(rb_node *n) {
 }
 
 bool block_less_by_ptr(const void *a, const void *b) {
-  const block_t *ba = a;
-  const block_t *bb = b;
+  const chunk_t *ba = a;
+  const chunk_t *bb = b;
   return ba->ptr < bb->ptr;
 }
 
@@ -528,31 +528,31 @@ rb_tree *create_block_file_rbtree(uint64_t total_size) {
 }
 
 int rbtree_file_insert(rb_tree *t, uint64_t ptr, uint64_t size) {
-  block_t *block = malloc(sizeof(block_t));
+  chunk_t *block = malloc(sizeof(chunk_t));
   block->ptr = ptr;
   block->size = size;
-  block_aug_t *aug = malloc(sizeof(block_aug_t));
+  chunk_aug_t *aug = malloc(sizeof(chunk_aug_t));
   aug->max_size = size;
 
   return rb_insert(t, block, aug);
 }
 
 int rbtree_file_delete(rb_tree *t, uint64_t ptr, uint64_t size) {
-  block_t *block = malloc(sizeof(block_t));
+  chunk_t *block = malloc(sizeof(chunk_t));
   block->ptr = ptr;
   block->size = size;
-  block_aug_t *aug = malloc(sizeof(block_aug_t));
+  chunk_aug_t *aug = malloc(sizeof(chunk_aug_t));
   aug->max_size = size;
 
   return rb_delete(t, block);
 }
 
 void read_node_data(rb_node *node, uint64_t *ptr, uint64_t *size, uint64_t *max_size) {
-  block_t *block = (block_t*)node->data;
+  chunk_t *block = (chunk_t*)node->data;
   *ptr = block->ptr;
   *size = block->size;
 
-  block_aug_t *aug = (block_aug_t*)node->augmented;
+  chunk_aug_t *aug = (chunk_aug_t*)node->augmented;
   *max_size = aug->max_size;
 }
 
@@ -567,9 +567,9 @@ int rb_get_free_ptr(rb_tree* t, uint64_t size, uint64_t *ptr) {
 
   bool keep_going = true;
   while (keep_going) {
-    if (node->left && (((block_aug_t*)node->left->augmented)->max_size >= max_size)) {
+    if (node->left && (((chunk_aug_t*)node->left->augmented)->max_size >= max_size)) {
       node = node->left;
-    } else if (node->right && (((block_aug_t*)node->right->augmented)->max_size >= max_size)) {
+    } else if (node->right && (((chunk_aug_t*)node->right->augmented)->max_size >= max_size)) {
       node = node->right;
     } else {
       // This is the terminal node
@@ -595,12 +595,12 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     return -1;
   }
 
-  block_t *block = malloc(sizeof(block));
+  chunk_t *block = malloc(sizeof(block));
   block->ptr = ptr;
   block->size = size;
 
   // Deal with block starting at ptr
-  block_t *b = (block_t*)rb_find(t, block);
+  chunk_t *b = (chunk_t*)rb_find(t, block);
   if (b) {
     uint64_t b_ptr = b->ptr;
     uint64_t b_size = b->size;
@@ -611,8 +611,8 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     } 
   }
 
-  block_t *prev = (block_t*)rb_next_smaller(t, block);
-  block_t *next = (block_t*)rb_next_larger(t, block);
+  chunk_t *prev = (chunk_t*)rb_next_smaller(t, block);
+  chunk_t *next = (chunk_t*)rb_next_larger(t, block);
 
   // interval lies entirely within an existing free block
   // nothing needs to be done
@@ -630,7 +630,7 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     ptr = prev->ptr;
     size += a - c;
     rbtree_file_delete(t, prev->ptr, prev->size);
-    prev = (block_t*)rb_next_smaller(t, block);
+    prev = (chunk_t*)rb_next_smaller(t, block);
   }
 
   while (next && ptr + size >= next->ptr) {
@@ -644,7 +644,7 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
       size += d - b;
     }
     rbtree_file_delete(t, next->ptr, next->size);
-    next = (block_t*)rb_next_larger(t, block);
+    next = (chunk_t*)rb_next_larger(t, block);
   }
   
   // At this point, there are no overlaps. Insert and return
@@ -664,15 +664,15 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     return -1;
   }
 
-  block_t *block = malloc(sizeof(block));
+  chunk_t *block = malloc(sizeof(block));
   block->ptr = ptr;
   block->size = size;
 
-  block_t *prev = (block_t*)rb_next_smaller(t, block);
-  block_t *next = (block_t*)rb_next_larger(t, block);
+  chunk_t *prev = (chunk_t*)rb_next_smaller(t, block);
+  chunk_t *next = (chunk_t*)rb_next_larger(t, block);
 
   // Deal with block starting at ptr
-  block_t *b = (block_t*) rb_find(t, block);
+  chunk_t *b = (chunk_t*) rb_find(t, block);
   if (b) {
     uint64_t b_ptr = b->ptr;
     uint64_t b_size = b->size;
@@ -707,7 +707,7 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     uint64_t c = prev->ptr;
     rbtree_file_delete(t, prev->ptr, prev->size);
     rbtree_file_insert(t, c, a - c);
-    prev = (block_t*)rb_next_smaller(t, block);
+    prev = (chunk_t*)rb_next_smaller(t, block);
   }
 
   // ---a******b------
@@ -721,7 +721,7 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     if (d > b) {
       rbtree_file_insert(t, b, d - b);
     }
-    next = (block_t*)rb_next_larger(t, block);
+    next = (chunk_t*)rb_next_larger(t, block);
   }
   
   free(block);
@@ -739,8 +739,8 @@ void print_tree_recursive(rb_node *n, int depth) {
   }
 
   // Print current node info
-  block_t *blk = (block_t *)n->data;
-  block_aug_t *aug = (block_aug_t *)n->augmented;
+  chunk_t *blk = (chunk_t *)n->data;
+  chunk_aug_t *aug = (chunk_aug_t *)n->augmented;
   char color = n->color == RED ? 'R' : 'B';
 
   printf("[%li, %li] (color=%c", blk->ptr, blk->size, color);
@@ -777,7 +777,7 @@ static void serialize_node(rb_node *n, char **buffer_ptr) {
     return;
   }
 
-  block_t *b = (block_t*)n->data;
+  chunk_t *b = (chunk_t*)n->data;
   memcpy(*buffer_ptr, &b->ptr, sizeof(uint64_t));
   *buffer_ptr += sizeof(uint64_t);
 
@@ -798,7 +798,7 @@ static rb_node* deserialize_node(char **buffer_ptr, size_t *offset, size_t total
     return NULL;
   }
 
-  block_t *b = malloc(sizeof(block_t));
+  chunk_t *b = malloc(sizeof(chunk_t));
   memcpy(&b->ptr, *buffer_ptr, sizeof(uint64_t));
   *buffer_ptr += sizeof(uint64_t);
 
@@ -811,8 +811,8 @@ static rb_node* deserialize_node(char **buffer_ptr, size_t *offset, size_t total
 
   rb_node *n = malloc(sizeof(rb_node));
   n->data = b;
-  n->augmented = malloc(sizeof(block_aug_t));
-  ((block_aug_t*)n->augmented)->max_size = b->size;
+  n->augmented = malloc(sizeof(chunk_aug_t));
+  ((chunk_aug_t*)n->augmented)->max_size = b->size;
   n->color = (rb_color)color;
   n->left = NULL;
   n->right = NULL;

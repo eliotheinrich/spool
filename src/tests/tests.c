@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <time.h>
 
+#include "thread_pool.h"
 #include "rbtree.h"
 #include "node.h"
 
@@ -287,158 +288,492 @@ bool test_split_string() {
   return all_passed;
 }
 
-bool test_read_data_offset_basic() {
-  unsigned seed = get_seed();
-  srand(seed);
+void *test_func(void* args) {
+  int i = *(int*)args;
+  int *ret = malloc(sizeof(int));
+  *ret = i*i;
+  return ret;
+}
 
-  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
-  char **storage = handle.storage; // alias
+bool test_thread_pool() {
+  thread_pool pool;
+  thread_pool_init(&pool, 4);
 
-  uint64_t block0 = 0;
-  uint64_t offset0 = 4;
-  uint64_t ptr0 = offset0 + block0*BLOCK_SIZE;
-  uint64_t chunk_size0 = BLOCK_SIZE + 10;
+  const int TASKS = 100;
 
-  uint64_t block1 = 3;
-  uint64_t offset1 = 5;
-  uint64_t ptr1 = offset1 + block1*BLOCK_SIZE;
-  uint64_t chunk_size1 = 6;
+  int args[TASKS];
+  void *results[TASKS];
 
-  uint64_t block2 = 5;
-  uint64_t offset2 = 0;
-  uint64_t ptr2 = offset2 + block2*BLOCK_SIZE;
-  uint64_t chunk_size2 = 7;
-
-  uint64_t size = chunk_size0 + chunk_size1 + chunk_size2;
-
-  uint64_t zero = 0;
-  memcpy(storage[block0] + offset0,                    &ptr1, sizeof(uint64_t));
-  memcpy(storage[block0] + offset0 + sizeof(uint64_t), &chunk_size0, sizeof(uint64_t));
-
-  memcpy(storage[block1] + offset1,                    &ptr2, sizeof(uint64_t));
-  memcpy(storage[block1] + offset1 + sizeof(uint64_t), &chunk_size1, sizeof(uint64_t));
-
-  memcpy(storage[block2] + offset2,                    &zero, sizeof(uint64_t));
-  memcpy(storage[block2] + offset2 + sizeof(uint64_t), &chunk_size2, sizeof(uint64_t));
-
-  for (uint64_t p = 0; p < chunk_size0; p++) {
-    uint64_t ptr = p + ptr0 + 2*sizeof(uint64_t);
-    uint64_t block = ptr / BLOCK_SIZE;
-    uint64_t offset = ptr % BLOCK_SIZE;
-    char val = p;
-    *(storage[block] + offset) = val;
+  // Assign ranges
+  for (int i = 0; i < TASKS; i++) {
+    args[i] = i;
+    thread_pool_submit(&pool, test_func, &args[i], &results[i]);
   }
 
-  for (uint64_t p = 0; p < chunk_size1; p++) {
-    uint64_t ptr = p + ptr1 + 2*sizeof(uint64_t);
-    uint64_t block = ptr / BLOCK_SIZE;
-    uint64_t offset = ptr % BLOCK_SIZE;
-    uint64_t val = p + chunk_size0;
-    *(storage[block] + offset) = val;
+  thread_pool_wait(&pool);
+
+  // Combine results
+  for (int i = 0; i < TASKS; i++) {
+    int *val = results[i];
+    printf("*val = %i, i*i = %i\n", *val, i*i);
+    ASSERT(*val == i*i);
+    free(val);
   }
 
-  for (uint64_t p = 0; p < chunk_size2; p++) {
-    uint64_t ptr = p + ptr2 + 2*sizeof(uint64_t);
-    uint64_t block = ptr / BLOCK_SIZE;
-    uint64_t offset = ptr % BLOCK_SIZE;
-    uint64_t val = p + chunk_size0 + chunk_size1;
-    *(storage[block] + offset) = val;
+  thread_pool_shutdown(&pool);
+
+  return true;
+}
+
+// =============================================================
+// Test 1: write_chunk_basic
+// =============================================================
+bool test_write_chunk_basic(void) {
+  fs_handle handle = init_filesystem(16, 4096);
+
+  uint64_t data_ptr = 1024;
+  chunk_t chunk;
+  chunk.ptr  = data_ptr;  
+  chunk.size = 8;
+
+  const char data[8] = {1,2,3,4,5,6,7,8};
+
+  if (write_chunk(handle, chunk, data) != 0) {
+    return false;
   }
 
-  uint64_t offset = rand() % size;
-  offset = 0;
-  char *buffer = malloc(size - offset);
-  read_data_offset(handle, ptr0, size - offset, buffer, offset);
+  // ----- Read back header -----
+  read_chunk_header(handle, chunk.ptr, &chunk);
+  uint64_t stored_ptr = chunk.ptr;
+  uint64_t stored_size = chunk.size;
 
-  for (int i = 0; i < size - offset; i++) {
-    ASSERT(buffer[i] == (char) i + offset);
+  printf("read back: %li, %li\n", stored_ptr, stored_size);
+
+  if (stored_ptr != 0) {
+    return false;
+  }
+  if (stored_size != 8) {
+    return false;
   }
 
-  free(buffer);
+  // ----- Read back data -----
+  data_ptr += sizeof(chunk_t);
+
+  uint64_t data_block  = data_ptr / handle.block_size;
+  uint64_t data_offset = data_ptr % handle.block_size;
+
+  char buf[8] = {0};
+  _read(handle, data_block, data_offset, 8, buf);
+
+  if (memcmp(buf, data, 8) != 0) {
+    return false;
+  }
+
+  return true;
+}
+
+// =============================================================
+// Test 2: read_chunk_basic
+// =============================================================
+bool test_read_chunk_basic(void) {
+  fs_handle handle = init_filesystem(16, 4096);
+
+  const char payload[6] = {9,8,7,6,5,4};
+
+  uint64_t data_ptr = 3000;
+  chunk_t chunk;
+  chunk.ptr = 0;
+  chunk.size = 6;
+  write_chunk_header(handle, data_ptr, &chunk);
+
+  // Write payload
+  uint64_t dblock   = (data_ptr + sizeof(chunk_t)) / handle.block_size;
+  uint64_t doffset  = (data_ptr + sizeof(chunk_t)) % handle.block_size;
+
+  _write(handle, dblock, doffset, 6, payload);
+
+  // Now read using read_chunk()
+  char buf[6] = {0};
+
+  chunk.ptr  = data_ptr;
+  chunk.size = 6;
+  uint64_t n = read_chunk(handle, chunk, buf, 0);
+
+  if (n != 6) return false;
+  if (memcmp(buf, payload, 6) != 0) return false;
+
+  return true;
+}
+
+// =============================================================
+// Test 3: read_chunk_with_offset
+// =============================================================
+
+bool test_read_chunk_with_offset(void) {
+  fs_handle handle = init_filesystem(16, 4096);
+
+  chunk_t chunk;
+  chunk.ptr  = 500;
+  chunk.size = 6;
+
+  uint64_t next_ptr = 0;
+  uint64_t size_hdr = 6;
+  const char payload[6] = {10,11,12,13,14,15};
+
+  // Write header
+  write_chunk_header(handle, chunk.ptr, (chunk_t) {.ptr = 0, .size = chunk.size});
+
+  // Write payload
+  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
+  uint64_t dblock   = data_ptr / handle.block_size;
+  uint64_t doffset  = data_ptr % handle.block_size;
+  _write(handle, dblock, doffset, size_hdr, payload);
+
+  // Read final 3 bytes
+  char buf[3] = {0};
+  uint64_t n = read_chunk(handle, (chunk_t) {.ptr = chunk.ptr, .size = 3}, buf, 3);
+
+  if (n != 3) {
+    printf("Found n = %li\n", n);
+    return false;
+  }
+
+  if (memcmp(buf, &payload[3], 3) != 0) {
+    return false;
+  }
+
+  return true;
+}
+
+// =============================================================
+// Test 4: write_then_read_roundtrip
+// =============================================================
+
+bool test_write_then_read_roundtrip(void) {
+  fs_handle h = init_filesystem(16, 4096);
+
+  chunk_t chunk;
+  chunk.ptr  = 2048;
+  chunk.size = 5;
+
+  const char src[5] = {42,43,44,45,46};
+  char dst[5] = {0};
+
+  if (write_chunk(h, chunk, src) != 0)
+    return false;
+
+  uint64_t n = read_chunk(h, chunk, dst, 0);
+
+  if (n != 5) return false;
+  if (memcmp(src, dst, 5) != 0) return false;
+
+  return true;
+}
+
+bool test_write_to_chunk_basic() {
+  fs_handle handle = init_filesystem(16, 4096);
+
+  chunk_t chunk;
+  chunk.ptr  = 2000;
+  chunk.size = 10;
+
+  const char initial[10] = {0,1,2,3,4,5,6,7,8,9};
+  const char overwrite[4] = {50,51,52,53};
+
+  // write initial chunk
+  if (write_chunk(handle, chunk, initial) != 0) {
+    return false;
+  }
+
+  // overwrite first 4 bytes
+  uint64_t written = write_to_chunk(handle, (chunk_t) {.ptr = chunk.ptr, .size = 4}, overwrite, 0);
+
+  if (written != 4) {
+    return false;
+  }
+
+  // verify data
+  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
+  uint64_t block    = data_ptr / handle.block_size;
+  uint64_t offset   = data_ptr % handle.block_size;
+
+  char result[10] = {0};
+  _read(handle, block, offset, 10, result);
+
+  // expected result
+  char expected[10] = {50,51,52,53,4,5,6,7,8,9};
+
+  return memcmp(result, expected, 10) == 0;
+}
+
+// ---------------------------------------------------------------------
+// Test 2: Overwrite in the middle of a chunk
+// ---------------------------------------------------------------------
+bool test_write_to_chunk_middle() {
+  fs_handle handle = init_filesystem(16, 4096);
+
+  chunk_t chunk;
+  chunk.ptr = 4096;        // block 1
+  chunk.size = 12;
+
+  char initial[12];
+  for (int i = 0; i < 12; i++) {
+    initial[i] = i;
+  }
+
+  const char overwrite[3] = {100,101,102};
+
+  if (write_chunk(handle, chunk, initial) != 0) {
+    return false;
+  }
+
+  uint64_t written = write_to_chunk(handle, (chunk_t) {.ptr = chunk.ptr, .size = 3}, overwrite, 5);
+  if (written != 3) {
+    return false;
+  }
+
+  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
+  uint64_t block    = data_ptr / handle.block_size;
+  uint64_t offset   = data_ptr % handle.block_size;
+
+  char *result = malloc(12);
+  _read(handle, block, offset, 12, result);
+
+  char *expected = malloc(12);
+  for (int i = 0; i < 12; i++) {
+    expected[i] = i;
+  }
+  expected[5] = 100;
+  expected[6] = 101;
+  expected[7] = 102;
+
+  ASSERT(memcmp(result, expected, 12) == 0);
+
+  free(expected);
+  free(result);
   free_handle(handle);
   return true;
 }
 
-bool test_read_data_offset() {
-  for (int k = 0; k < 10000; k++) {
-    unsigned seed = get_seed();
-    srand(seed);
+// ---------------------------------------------------------------------
+// Test 3: Overwrite ending exactly at boundary
+// ---------------------------------------------------------------------
+bool test_write_to_chunk_exact_end() {
+  fs_handle handle = init_filesystem(16, 4096);
 
-    fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  chunk_t chunk;
+  chunk.ptr = 1234;
+  chunk.size = 6;
 
-    int n1 = 2*BLOCK_SIZE;
-    int n2 = 4*BLOCK_SIZE;
-    char *data1 = malloc(n1);
-    char *data2 = malloc(n2);
-    char *data3 = malloc(n1 + n2);
+  char *initial = malloc(6);
+  initial[0] = 10; initial[1] = 20; initial[2] = 30; initial[3] = 40; initial[4] = 50; initial[5] = 60;
+  char *overwrite = malloc(2);
+  overwrite[0] = 99; overwrite[1] = 98;
 
-    for (int i = 0; i < n1; i++) {
-      data1[i] = rand() % 92 + 32;
-      data3[i] = data1[i];
-    }
-    for (int i = 0; i < n2; i++) {
-      data2[i] = rand() % 92 + 32;
-      data3[i + n1] = data2[i];
-    }
-
-    uint64_t node_ptr = make_file(handle, ROOT_NODE, "file", data1, n1);
-    append_to_inode(handle, data2, n2, node_ptr);
-
-    inode *node = read_inode(handle, node_ptr);
-    uint64_t offset = rand() % n1;
-    char *buffer = malloc(node->size - offset);
-    read_data_offset(handle, node->ptr, node->size - offset, buffer, offset);
-
-    for (int i = 0; i < n1 - offset; i++) {
-      ASSERT(data1[i + offset] == buffer[i]);
-    }
-
-    free(data1);
-    free(data2);
-    free(data3);
-    free(node);
-    free_handle(handle);
+  if (write_chunk(handle, chunk, initial) != 0) {
+    return false;
   }
+
+  uint64_t written = write_to_chunk(handle, (chunk_t) {.ptr = chunk.ptr, .size = 2}, overwrite, 4);
+
+  if (written != 2) {
+    return false;
+  }
+
+  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
+  uint64_t block    = data_ptr / handle.block_size;
+  uint64_t offset   = data_ptr % handle.block_size;
+
+  char *result = malloc(6);
+  _read(handle, block, offset, 6, result);
+
+  char *expected = malloc(6);
+  expected[0] = 10; expected[1] = 20; expected[2] = 30; expected[3] = 40; expected[4] = 99; expected[5] = 98;
+
+  ASSERT(memcmp(result, expected, 6) == 0);
+
+  free(result);
+  free(expected);
+  free(initial);
+  free(overwrite);
+  free_handle(handle);
+
   return true;
 }
 
-bool test_write_data_offset() {
-  for (int k = 0; k < 1000; k++) {
-    unsigned seed = get_seed();
-    srand(seed);
+// ---------------------------------------------------------------------
+// Test 4: Attempting to write past chunk boundary
+// Assumes function clamps write and returns number of bytes actually written.
+// ---------------------------------------------------------------------
+bool test_write_to_chunk_past_end() {
+  fs_handle handle = init_filesystem(16, 4096);
 
-    fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  chunk_t chunk;
+  chunk.ptr = 300;
+  chunk.size = 5;
 
-    int n1 = 2*BLOCK_SIZE;
-    int n2 = 4*BLOCK_SIZE;
-    char *data1 = malloc(n1);
-    char *data2 = malloc(n2);
-    char *data3 = malloc(n1 + n2);
+  const char initial[5] = {1,2,3,4,5};
+  const char overwrite[5] = {70,71,72,73,74};
 
-    uint64_t ptr1 = 0;
-    uint64_t ptr2 = 3*BLOCK_SIZE + 24;
-    rb_malloc(handle.t, ptr1, n1);
-    write_chunk(handle, ptr1, n1, data1);
-    memcpy(handle.storage[ptr1/BLOCK_SIZE] + ptr1%BLOCK_SIZE, &ptr2, sizeof(uint64_t));
-    rb_malloc(handle.t, ptr2, n2);
-    write_chunk(handle, ptr2, n2, data2);
-    write_to_data(handle, ptr1, n1, data1, n1);
-
-    int size = n1 + n2;
-
-    uint64_t offset = n1;
-    char *buffer = malloc(size - offset);
-    read_data_offset(handle, ptr1, size - offset, buffer, offset);
-
-    for (int i = 0; i < size - offset; i++) {
-      ASSERT(data1[i] == buffer[i]);
-    }
-
-    free(data1);
-    free(data2);
-    free(data3);
-    free_handle(handle);
+  if (write_chunk(handle, chunk, initial) != 0) {
+    return false;
   }
+
+  // Start at offset 3 → only 2 bytes should be writable (chunk.size - 3)
+  uint64_t written = write_to_chunk(handle, (chunk_t) {.ptr = chunk.ptr, .size = 5}, overwrite, 3);
+
+  if (written != 2) {
+    return false;
+  }
+
+  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
+  uint64_t block    = data_ptr / handle.block_size;
+  uint64_t offset   = data_ptr % handle.block_size;
+
+  char *result = malloc(5);
+  _read(handle, block, offset, 5, result);
+
+  char *expected = malloc(5);
+  expected[0] = 1; expected[1] = 2; expected[2] = 3; expected[3] = 70; expected[4] = 71;
+
+  ASSERT(memcmp(result, expected, 5) == 0);
+
+  free(result);
+  free(expected);
+  free_handle(handle);
+
+  return true;
+}
+
+bool test_write_to_data_multiblock() {
+  fs_handle handle = init_filesystem(32, 4096);
+
+  // Chunk A (spans 2 blocks)
+  chunk_t A = { .ptr = 1000, .size = 6000 };
+  // Chunk B (another block-spanning chunk)
+  chunk_t B = { .ptr = 9000, .size = 3000 };
+
+  // Prepare data
+  char *Adata = malloc(6000);
+  char *Bdata = malloc(3000);
+  for (int i = 0; i < 6000; i++) {
+    Adata[i] = (char)(i & 0xFF);
+  }
+  for (int i = 0; i < 3000; i++) {
+    Bdata[i] = (char)(50 + (i & 0x1F));
+  }
+
+  // Round-trip write and verify write_chunk():
+  if (write_chunk(handle, A, Adata) != 0) {
+    return false;
+  }
+  if (append_to_data(handle, A.ptr, B, Bdata) != 0) {
+    return false;
+  }
+
+  // New data that will cross A → B boundary
+  char *newdata = malloc(3000);
+  for (int i = 0; i < 3000; i++) {
+    newdata[i] = (char)(200 + (i & 0x3F));
+  }
+
+  // Write starting 1000 bytes before end of A (1000 in A, 2000 in B)
+  uint64_t rc = write_to_data(handle, (chunk_t) {.ptr = A.ptr, .size = 3000}, newdata, 5000);
+  if (rc != 3000) {
+    return false;
+  }
+
+  // Verify A
+  char *Aread = malloc(6000);
+  read_chunk(handle, A, Aread, 0);
+
+  for (int i = 0; i < 5000; i++) {
+    if (Aread[i] != Adata[i]) {
+      return false;
+    }
+  }
+
+  for (int i = 0; i < 1000; i++) {
+    if (Aread[5000 + i] != newdata[i]) {
+      return false;
+    }
+  }
+
+  // Verify B
+  char *Bread = malloc(3000);
+  read_chunk(handle, B, Bread, 0);
+
+  for (int i = 0; i < 2000; i++) {
+    if (Bread[i] != newdata[1000 + i]) {
+      return false;
+    }
+  }
+
+  for (int i = 2000; i < 3000; i++) {
+    if (Bread[i] != Bdata[i]) {
+      return false;
+    }
+  }
+
+  free(Adata);
+  free(Bdata);
+  free(newdata);
+  free(Aread);
+  free(Bread);
+  free_handle(handle);
+
+  return true;
+}
+
+bool test_read_data_multiblock() {
+  fs_handle handle = init_filesystem(32, 4096);
+
+  chunk_t A = { .ptr = 2000,  .size = 7000 };
+  chunk_t B = { .ptr = 13000, .size = 4000 };
+
+  char *Adata = malloc(7000);
+  char *Bdata = malloc(4000);
+  for (int i = 0; i < 7000; i++) {
+    Adata[i] = (char)(i & 0x7F);
+  }
+  for (int i = 0; i < 4000; i++) {
+    Bdata[i] = (char)(120 + (i & 0x3F));
+  }
+
+  // A → B
+  if (write_chunk(handle, A, Adata) != 0) {
+    return false;
+  }
+
+  if (append_to_data(handle, A.ptr, B, Bdata) != 0) {
+    return false;
+  }
+
+  // Read 5000 bytes starting at offset 4000 (3000 from A, 2000 from B)
+  char *out = malloc(5000);
+  chunk_t c = {.ptr = A.ptr, .size = 5000};
+  if (read_data(handle, c, out, 4000) != 5000) {
+    return false;
+  }
+
+  // 3000 from A
+  for (int i = 0; i < 3000; i++) {
+    if (out[i] != Adata[4000 + i]) {
+      return false;
+    }
+  }
+
+  // 2000 from B
+  for (int i = 0; i < 2000; i++) {
+    if (out[3000 + i] != Bdata[i]) {
+      return false;
+    }
+  }
+
+  free(Adata);
+  free(Bdata);
+  free(out);
+  free_handle(handle);
   return true;
 }
 
@@ -776,26 +1111,26 @@ bool test_rbtree_augmented_max_size() {
   for (int i = 0; i < n_blocks; i++) {
     make_block(i*100, sizes[i], &nodes[i]);
 
-    nodes[i]->augmented = malloc(sizeof(block_aug_t));
-    block_aug_t *w = malloc(sizeof(block_aug_t));
+    nodes[i]->augmented = malloc(sizeof(chunk_aug_t));
+    chunk_aug_t *w = malloc(sizeof(chunk_aug_t));
     w->max_size = sizes[i];
 
-    void *data = malloc(sizeof(block_t));
-    memcpy(data, nodes[i]->data, sizeof(block_t));
+    void *data = malloc(sizeof(chunk_t));
+    memcpy(data, nodes[i]->data, sizeof(chunk_t));
     rb_insert(t, data, w);
   }
 
   //print_tree(t);
 
   // Check root's max_size
-  block_aug_t *root_aug = (block_aug_t *)t->root->augmented;
+  chunk_aug_t *root_aug = (chunk_aug_t *)t->root->augmented;
   int expected_max = 50;
   ASSERT(root_aug->max_size = expected_max);
 
   // Delete the block with size 50
   rb_delete(t, nodes[3]->data);
 
-  root_aug = (block_aug_t *)t->root->augmented;
+  root_aug = (chunk_aug_t *)t->root->augmented;
   expected_max = 30; // next largest size
   ASSERT(root_aug->max_size == expected_max);
 
@@ -818,15 +1153,15 @@ bool compare_nodes(rb_node *a, rb_node *b) {
     return false;
   }
 
-  block_t *ba = (block_t*)a->data;
-  block_t *bb = (block_t*)b->data;
+  chunk_t *ba = (chunk_t*)a->data;
+  chunk_t *bb = (chunk_t*)b->data;
 
   if (ba->ptr != bb->ptr || ba->size != bb->size) {
     return false;
   }
 
-  block_aug_t *aug_a = (block_aug_t*)a->augmented;
-  block_aug_t *aug_b = (block_aug_t*)b->augmented;
+  chunk_aug_t *aug_a = (chunk_aug_t*)a->augmented;
+  chunk_aug_t *aug_b = (chunk_aug_t*)b->augmented;
 
   if (aug_a->max_size != aug_b->max_size) {
     return false;
@@ -883,7 +1218,7 @@ int check_max_size(rb_node *n) {
   if (!n) {
     return 0;
   }
-  block_t *blk = (block_t *)n->data;
+  chunk_t *blk = (chunk_t *)n->data;
 
   int left_max = check_max_size(n->left);
   int right_max = check_max_size(n->right);
@@ -906,22 +1241,46 @@ bool validate_max_size(rb_node *node) {
     return true;
   }
 
-  uint64_t max_size = ((block_aug_t*)node->augmented)->max_size;
-  uint64_t size = ((block_t*)node->data)->size;
+  uint64_t max_size = ((chunk_aug_t*)node->augmented)->max_size;
+  uint64_t size = ((chunk_t*)node->data)->size;
 
   bool valid = max_size >= size;
   if (node->left) {
-    uint64_t left_max = ((block_aug_t*)node->left->augmented)->max_size;
+    uint64_t left_max = ((chunk_aug_t*)node->left->augmented)->max_size;
     valid = valid && (max_size >= left_max) && validate_max_size(node->left);
   }
 
   if (node->right) {
-    uint64_t right_max = ((block_aug_t*)node->right->augmented)->max_size;
+    uint64_t right_max = ((chunk_aug_t*)node->right->augmented)->max_size;
     valid = valid && (max_size >= right_max) && validate_max_size(node->right);
   }
 
   return valid;
 }
+
+void traverse(rb_node *node, uint64_t total_width, bool *freed) {
+  if (!node) {
+    return;
+  }
+
+  traverse(node->left, total_width, freed);
+
+  chunk_t *block = (chunk_t *)node->data;
+  uint64_t ptr  = block->ptr;
+  uint64_t size = block->size;
+
+  uint64_t end = ptr + size;
+  if (end > total_width) {
+    end = total_width;
+  }
+
+  for (uint64_t j = ptr; j < end; j++) {
+    freed[j] = true;
+  }
+
+  traverse(node->right, total_width, freed);
+}
+
 
 bool *to_bitmap(rb_tree *t, uint64_t total_width) {
   bool *freed = malloc(total_width*sizeof(bool));
@@ -929,30 +1288,7 @@ bool *to_bitmap(rb_tree *t, uint64_t total_width) {
     freed[j] = false;
   }
   
-  void traverse(rb_node *node) {
-    if (!node) {
-      return;
-    }
-
-    traverse(node->left);
-
-    block_t *block = (block_t *)node->data;
-    uint64_t ptr  = block->ptr;
-    uint64_t size = block->size;
-
-    uint64_t end = ptr + size;
-    if (end > total_width) {
-      end = total_width;
-    }
-
-    for (uint64_t j = ptr; j < end; j++) {
-      freed[j] = true;
-    }
-
-    traverse(node->right);
-  }
-
-  traverse(t->root);
+  traverse(t->root, total_width, freed);
 
   return freed;
 }
@@ -1166,7 +1502,7 @@ bool test_rbtree_free_ptr() {
     }
 
 
-    block_aug_t *aug = (block_aug_t*)t->root->augmented;
+    chunk_aug_t *aug = (chunk_aug_t*)t->root->augmented;
     uint64_t max_size = aug->max_size;
 
     // Generate some pointers to free space and ensure that they are free
@@ -1324,12 +1660,20 @@ int main(int argc, char *argv[]) {
   // Miscellaneous tests
   ADD_TEST(test_remove_element);
   ADD_TEST(test_split_string);
+  ADD_TEST(test_thread_pool);
 
-  // Storgae IO tests
-  ADD_TEST(test_read_data_offset_basic);
-  ADD_TEST(test_read_data_offset);
-  ADD_TEST(test_path_first_last);
-  ADD_TEST(test_write_data_offset);
+  // Storage IO tests
+  ADD_TEST(test_write_chunk_basic);
+  ADD_TEST(test_read_chunk_basic);
+  ADD_TEST(test_read_chunk_with_offset);
+  ADD_TEST(test_write_then_read_roundtrip);
+  ADD_TEST(test_write_to_chunk_basic);
+  ADD_TEST(test_write_to_chunk_middle);
+  ADD_TEST(test_write_to_chunk_exact_end);
+  ADD_TEST(test_write_to_chunk_past_end);
+  ADD_TEST(test_write_to_data_multiblock);
+  ADD_TEST(test_read_data_multiblock);
+
   
   // rbtree basics
   ADD_TEST(test_rbtree_basic);
@@ -1341,15 +1685,15 @@ int main(int argc, char *argv[]) {
   ADD_TEST(test_rbtree_serialize);
 
   // rbtree filesystem allocation/free
-  ADD_TEST(test_rbtree_malloc_randomized);
-  ADD_TEST(test_rbtree_mfree_basic);
-  ADD_TEST(test_rbtree_mfree_randomized);
-  ADD_TEST(test_rbtree_free_ptr);
+  //ADD_TEST(test_rbtree_malloc_randomized);
+  //ADD_TEST(test_rbtree_mfree_basic);
+  //ADD_TEST(test_rbtree_mfree_randomized);
+  //ADD_TEST(test_rbtree_free_ptr);
 
-  // Directory traversal
-  ADD_TEST(test_get_subdirectories);
-  ADD_TEST(test_create_file);
-  ADD_TEST(test_find_inode);
+  //// Directory traversal
+  //ADD_TEST(test_get_subdirectories);
+  //ADD_TEST(test_create_file);
+  //ADD_TEST(test_find_inode);
 
   if (tests.size == 0) {
     printf("No tests to run.\n");

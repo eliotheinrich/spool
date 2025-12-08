@@ -10,12 +10,12 @@ FUSE_FLAGS = $(shell pkg-config fuse3 --cflags --libs)
 
 MAIN_SRC = $(SRC_DIR)/main.c
 RBTREE_SRC = $(SRC_DIR)/rbtree.c
+POOL_SRC = $(SRC_DIR)/thread_pool.c
 NODE_SRC = $(SRC_DIR)/node.c
 TEST_SRC = $(TEST_DIR)/tests.c
 
-
-MAIN_OBJ = $(MAIN_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o)
-TEST_OBJ = $(TEST_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o)
+MAIN_OBJ = $(MAIN_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o) $(POOL_SRC:.c=.o)
+TEST_OBJ = $(TEST_SRC:.c=.o) $(RBTREE_SRC:.c=.o) $(NODE_SRC:.c=.o) $(POOL_SRC:.c=.o)
 
 .PHONY: all clean
 

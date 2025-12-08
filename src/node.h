@@ -10,6 +10,7 @@
 #include <mpi.h>
 #include <pthread.h>
 
+#include "thread_pool.h"
 #include "rbtree.h"
 
 #define MASTER 0
@@ -19,17 +20,19 @@
 // ---------------------------- fs_handle ----------------------------------------
 // ----------------------------------------------------------------------------- *
 
-typedef struct fs_handle {
+typedef struct {
   uint64_t num_blocks;
   uint64_t block_size;
   char *file_path;
   char **storage;
   rb_tree *t;
+  thread_pool *pool;
 } fs_handle;
 
 static uint32_t request_counter = 0;
 
 FILE *acquire_file(uint64_t block_size);
+fs_handle acquire_filesystem(uint64_t num_blocks, uint64_t block_size);
 fs_handle init_filesystem(uint64_t num_block, uint64_t block_size);
 void free_handle(fs_handle handle);
 char **malloc_blocks(int num_blocks, int block_size);
@@ -50,6 +53,7 @@ extern char original_cwd[1024];
 
 #define OP_READ 0
 #define OP_WRITE 1
+#define OP_WAIT 2
 
 int handle_requests(fs_handle handle);
 void read_chunk_from_row(uint64_t row, uint64_t offset, size_t size, char *buffer);
@@ -64,7 +68,7 @@ void send_write_request(uint64_t block, uint64_t offset, uint64_t size, const ch
 
 #define ROOT_NODE 0
 
-typedef struct inode {
+typedef struct {
   // file type/permissions
   uint32_t mode;
   uint32_t uid;
@@ -87,14 +91,15 @@ static const uint32_t FILETYPE_FILE = 0b001;
 static const uint32_t FILETYPE_DIR  = 0b010;
 static const uint32_t FILETYPE_ROOT = 0b100;
 
-static const uint64_t HEADER_SIZE = 2*sizeof(uint64_t);
-
+void set_timestamp(inode *node, const struct timespec tv[2]);
 char *path_first(const char *path, char **rest);
 char *path_last(const char *path, char **rest);
 char **split_string(const char *s, char delim);
 void remove_element(const char *buffer, size_t size, const char *str, char **out, size_t *out_size);
 
-char **get_subdirectories(const char *buffer, uint64_t size, uint64_t **inode_numbers);
+char **get_subdirectories(const char *buffer, uint64_t buffer_size, uint64_t **inode_numbers);
+
+void print_directory_content(char *content, uint64_t content_size);
 
 void write_inode(fs_handle handle, inode *node, uint64_t ptr);
 inode *read_inode(fs_handle handle, uint64_t ptr);
@@ -106,16 +111,20 @@ void print_inode(inode *node);
 // N P D D D ... N P D D D ...
 // where N is the number of bytes in each block, P is the pointer to the next block, and D is the bytes
 
-// Writes a block of data in storage starting at ptr
-int write_chunk(fs_handle handle, uint64_t ptr, uint64_t size, const char *buffer);
-int write_to_data(fs_handle, uint64_t ptr, uint64_t size, const char *buffer, uint64_t start);
+// Writes a chunk starting at chunk.ptr of size chunk.size
+int write_chunk(fs_handle handle, chunk_t chunk, const char *buffer);
+// Writes over a chunk starting at chunk.ptr at offset start with a buffer of chunk.size bytes
+uint64_t write_to_chunk(fs_handle handle, chunk_t chunk, const char *buffer, uint64_t offset);
+// Writes over a chunk chain starting at chunk.ptr at offset start with a buffer of chunk.size bytes
+uint64_t write_to_data(fs_handle handle, chunk_t chunk, const char *buffer, uint64_t offset);
+// Appends to a chunk starting at ptr. The destination chunk starts at chunk_dest.ptr and has size chunk_dest.size
+int append_to_data(fs_handle handle, uint64_t ptr, chunk_t chunk_dest, const char *buffer);
 
-// Reads a block of data in storage starting at ptr
-int read_data_offset(fs_handle, uint64_t ptr, uint64_t size, char *buffer_ptr, uint64_t start);
-int read_data(fs_handle handle, uint64_t ptr, uint64_t size, char *buffer);
-
-uint64_t read_u64(const char *buffer);
-void write_u64(char *buffer, uint64_t value);
+// Reads the chunk starting at chunk.ptr. This chunk must have size >= chunk.size
+uint64_t read_chunk(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offset);
+// Reads the content of a chunk chain, starting at offset start. This chunk starts at chunk.ptr
+// and has size at least chunk.size
+uint64_t read_data(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offset);
 
 char *read_inode_content(fs_handle handle, const inode *node);
 void replace_inode_content(fs_handle handle, uint64_t node_ptr, const char *buffer, uint64_t size);

@@ -28,10 +28,7 @@ static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler, off_
   uint64_t *inode_numbers = NULL;
   char **subdirs = get_subdirectories(content, node->size, &inode_numbers);
 
-  printf("Called fs_readdir\n");
-
   if (subdirs) {
-    printf("Found subdirs\n");
     char **p = subdirs;
     while (*p) {
       filler(data, *p, NULL, 0, 0);
@@ -115,7 +112,7 @@ static int fs_write(const char *path, const char *buf, size_t size, off_t offset
 
   // overwrite existing data
   if (to_write > 0) {
-    write_to_data(handle, node->ptr, to_write, buf, offset);
+    write_to_data(handle, (chunk_t){.ptr = node->ptr, .size = to_write}, buf, offset);
   }
 
   // append new data
@@ -182,7 +179,7 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset, struc
     size = node->size - offset;
   }
 
-  read_data_offset(handle, node->ptr, node->size, buf, (uint64_t) offset);
+  read_data(handle, (chunk_t) {.ptr = node->ptr, .size = node->size}, buf, (uint64_t) offset);
   return size;
 }
 
@@ -234,11 +231,6 @@ static int fs_unlink(const char *path) {
     return -1;
   }
 
-  if (!(node->mode & FILETYPE_DIR)) {
-    free(node);
-    return -EISDIR;
-  }
-
   free(node);
 
   char *rest;
@@ -251,12 +243,14 @@ static int fs_unlink(const char *path) {
     return -1;
   }
 
+
   char *parent_content = read_inode_content(handle, parent);
   char *removed;
   size_t out_size;
   remove_element(parent_content, parent->size, filename, &removed, &out_size);
   replace_inode_content(handle, parent_ptr, removed, out_size);
   remove_directory(handle, node_ptr);
+  parent = find_inode(handle, rest, &parent_ptr);
 
   free(parent);
   free(parent_content);
@@ -297,10 +291,7 @@ static int fs_utimens(const char *path, const struct timespec tv[2], struct fuse
     return -ENOENT;
   }
 
-  node->atime = tv[0].tv_sec;
-  node->mtime = tv[1].tv_sec;
-
-  node->ctime = time(NULL);
+  set_timestamp(node, tv);
 
   write_inode(handle, node, node_ptr);
 
@@ -351,6 +342,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+#ifdef MPI
   int provided;
   MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -368,8 +360,12 @@ int main(int argc, char **argv) {
     printf("Requires multi-threaded MPI model.\n");
     return 1;
   }
+#else
+  rank = 0;
+  world_size = 1;
+#endif
 
-  handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  handle = acquire_filesystem(NUM_BLOCKS, BLOCK_SIZE);
   signal(SIGINT, cleanup);
 
   int result;
