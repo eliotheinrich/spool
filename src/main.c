@@ -12,7 +12,7 @@
 static const uint32_t BLOCK_SIZE = 1024;
 static const uint32_t NUM_BLOCKS = 4;
 
-fs_handle handle;
+fs_handle *handle;
 
 static int fs_readdir(const char *path, void *data, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
   uint64_t node_ptr;
@@ -328,7 +328,7 @@ void save_file(char *filename, char *buffer, size_t size) {
 void cleanup(int signum) {
   if (rank == 0) {
     size_t size;
-    char *buffer = rb_serialize(handle.t, &size);
+    char *buffer = rb_serialize(handle->t, &size);
     save_file(RBTREE_FILENAME, buffer, size);
     free(buffer);
   }
@@ -365,7 +365,7 @@ int main(int argc, char **argv) {
   world_size = 1;
 #endif
 
-  handle = acquire_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  handle = acquire_filesystem(NUM_BLOCKS, BLOCK_SIZE, 5);
   signal(SIGINT, cleanup);
 
   int result;

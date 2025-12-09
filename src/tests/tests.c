@@ -88,23 +88,6 @@ unsigned get_seed() {
   return seed;
 }
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
-
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 bool test_remove_element() {
   char data[128]; 
   size_t size = 0;
@@ -315,7 +298,6 @@ bool test_thread_pool() {
   // Combine results
   for (int i = 0; i < TASKS; i++) {
     int *val = results[i];
-    printf("*val = %i, i*i = %i\n", *val, i*i);
     ASSERT(*val == i*i);
     free(val);
   }
@@ -325,11 +307,8 @@ bool test_thread_pool() {
   return true;
 }
 
-// =============================================================
-// Test 1: write_chunk_basic
-// =============================================================
-bool test_write_chunk_basic(void) {
-  fs_handle handle = init_filesystem(16, 4096);
+bool test_write_chunk_basic() {
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   uint64_t data_ptr = 1024;
   chunk_t chunk;
@@ -347,8 +326,6 @@ bool test_write_chunk_basic(void) {
   uint64_t stored_ptr = chunk.ptr;
   uint64_t stored_size = chunk.size;
 
-  printf("read back: %li, %li\n", stored_ptr, stored_size);
-
   if (stored_ptr != 0) {
     return false;
   }
@@ -359,11 +336,11 @@ bool test_write_chunk_basic(void) {
   // ----- Read back data -----
   data_ptr += sizeof(chunk_t);
 
-  uint64_t data_block  = data_ptr / handle.block_size;
-  uint64_t data_offset = data_ptr % handle.block_size;
+  uint64_t data_drive = data_ptr / handle->drive_size;
+  uint64_t data_offset = data_ptr % handle->drive_size;
 
   char buf[8] = {0};
-  _read(handle, data_block, data_offset, 8, buf);
+  read_from_drive(handle, data_drive, data_offset, 8, buf);
 
   if (memcmp(buf, data, 8) != 0) {
     return false;
@@ -372,11 +349,8 @@ bool test_write_chunk_basic(void) {
   return true;
 }
 
-// =============================================================
-// Test 2: read_chunk_basic
-// =============================================================
-bool test_read_chunk_basic(void) {
-  fs_handle handle = init_filesystem(16, 4096);
+bool test_read_chunk_basic() {
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   const char payload[6] = {9,8,7,6,5,4};
 
@@ -387,10 +361,10 @@ bool test_read_chunk_basic(void) {
   write_chunk_header(handle, data_ptr, &chunk);
 
   // Write payload
-  uint64_t dblock   = (data_ptr + sizeof(chunk_t)) / handle.block_size;
-  uint64_t doffset  = (data_ptr + sizeof(chunk_t)) % handle.block_size;
+  uint64_t ddrive   = (data_ptr + sizeof(chunk_t)) / handle->drive_size;
+  uint64_t doffset  = (data_ptr + sizeof(chunk_t)) % handle->drive_size;
 
-  _write(handle, dblock, doffset, 6, payload);
+  write_to_drive(handle, ddrive, doffset, 6, payload);
 
   // Now read using read_chunk()
   char buf[6] = {0};
@@ -405,12 +379,8 @@ bool test_read_chunk_basic(void) {
   return true;
 }
 
-// =============================================================
-// Test 3: read_chunk_with_offset
-// =============================================================
-
-bool test_read_chunk_with_offset(void) {
-  fs_handle handle = init_filesystem(16, 4096);
+bool test_read_chunk_with_offset() {
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   chunk_t chunk;
   chunk.ptr  = 500;
@@ -425,9 +395,9 @@ bool test_read_chunk_with_offset(void) {
 
   // Write payload
   uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
-  uint64_t dblock   = data_ptr / handle.block_size;
-  uint64_t doffset  = data_ptr % handle.block_size;
-  _write(handle, dblock, doffset, size_hdr, payload);
+  uint64_t ddrive   = data_ptr / handle->drive_size;
+  uint64_t doffset  = data_ptr % handle->drive_size;
+  write_to_drive(handle, ddrive, doffset, size_hdr, payload);
 
   // Read final 3 bytes
   char buf[3] = {0};
@@ -445,33 +415,41 @@ bool test_read_chunk_with_offset(void) {
   return true;
 }
 
-// =============================================================
-// Test 4: write_then_read_roundtrip
-// =============================================================
+bool test_write_then_read_roundtrip() {
+  int raid_levels[2] = {0, 5};
+  for (int i = 0; i < 2; i++) {
+    fs_handle *handle = init_filesystem(16, 4096, raid_levels[i]);
 
-bool test_write_then_read_roundtrip(void) {
-  fs_handle h = init_filesystem(16, 4096);
+    chunk_t chunk;
+    chunk.ptr  = 2048;
+    chunk.size = 5;
 
-  chunk_t chunk;
-  chunk.ptr  = 2048;
-  chunk.size = 5;
+    const char src[5] = {42,43,44,45,46};
+    char dst[5] = {0};
 
-  const char src[5] = {42,43,44,45,46};
-  char dst[5] = {0};
+    if (write_chunk(handle, chunk, src) != 0) {
+      printf("Returned wrong number from write_chunk\n");
+      return false;
+    }
 
-  if (write_chunk(h, chunk, src) != 0)
-    return false;
+    uint64_t n = read_chunk(handle, chunk, dst, 0);
 
-  uint64_t n = read_chunk(h, chunk, dst, 0);
+    if (n != 5) {
+      printf("Read wrong number of bytes. n = %li\n", n);
+      return false;
+    }
 
-  if (n != 5) return false;
-  if (memcmp(src, dst, 5) != 0) return false;
+    if (memcmp(src, dst, 5) != 0) {
+      printf("Read wrong data\n");
+      return false;
+    }
+  }
 
   return true;
 }
 
 bool test_write_to_chunk_basic() {
-  fs_handle handle = init_filesystem(16, 4096);
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   chunk_t chunk;
   chunk.ptr  = 2000;
@@ -494,11 +472,11 @@ bool test_write_to_chunk_basic() {
 
   // verify data
   uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
-  uint64_t block    = data_ptr / handle.block_size;
-  uint64_t offset   = data_ptr % handle.block_size;
+  uint64_t drive    = data_ptr / handle->drive_size;
+  uint64_t offset   = data_ptr % handle->drive_size;
 
   char result[10] = {0};
-  _read(handle, block, offset, 10, result);
+  read_from_drive(handle, drive, offset, 10, result);
 
   // expected result
   char expected[10] = {50,51,52,53,4,5,6,7,8,9};
@@ -506,14 +484,11 @@ bool test_write_to_chunk_basic() {
   return memcmp(result, expected, 10) == 0;
 }
 
-// ---------------------------------------------------------------------
-// Test 2: Overwrite in the middle of a chunk
-// ---------------------------------------------------------------------
 bool test_write_to_chunk_middle() {
-  fs_handle handle = init_filesystem(16, 4096);
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   chunk_t chunk;
-  chunk.ptr = 4096;        // block 1
+  chunk.ptr = 4096;        // drive 1
   chunk.size = 12;
 
   char initial[12];
@@ -533,11 +508,11 @@ bool test_write_to_chunk_middle() {
   }
 
   uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
-  uint64_t block    = data_ptr / handle.block_size;
-  uint64_t offset   = data_ptr % handle.block_size;
+  uint64_t drive    = data_ptr / handle->drive_size;
+  uint64_t offset   = data_ptr % handle->drive_size;
 
   char *result = malloc(12);
-  _read(handle, block, offset, 12, result);
+  read_from_drive(handle, drive, offset, 12, result);
 
   char *expected = malloc(12);
   for (int i = 0; i < 12; i++) {
@@ -555,11 +530,8 @@ bool test_write_to_chunk_middle() {
   return true;
 }
 
-// ---------------------------------------------------------------------
-// Test 3: Overwrite ending exactly at boundary
-// ---------------------------------------------------------------------
 bool test_write_to_chunk_exact_end() {
-  fs_handle handle = init_filesystem(16, 4096);
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   chunk_t chunk;
   chunk.ptr = 1234;
@@ -581,11 +553,11 @@ bool test_write_to_chunk_exact_end() {
   }
 
   uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
-  uint64_t block    = data_ptr / handle.block_size;
-  uint64_t offset   = data_ptr % handle.block_size;
+  uint64_t drive    = data_ptr / handle->drive_size;
+  uint64_t offset   = data_ptr % handle->drive_size;
 
   char *result = malloc(6);
-  _read(handle, block, offset, 6, result);
+  read_from_drive(handle, drive, offset, 6, result);
 
   char *expected = malloc(6);
   expected[0] = 10; expected[1] = 20; expected[2] = 30; expected[3] = 40; expected[4] = 99; expected[5] = 98;
@@ -601,12 +573,8 @@ bool test_write_to_chunk_exact_end() {
   return true;
 }
 
-// ---------------------------------------------------------------------
-// Test 4: Attempting to write past chunk boundary
-// Assumes function clamps write and returns number of bytes actually written.
-// ---------------------------------------------------------------------
 bool test_write_to_chunk_past_end() {
-  fs_handle handle = init_filesystem(16, 4096);
+  fs_handle *handle = init_filesystem(16, 4096, 0);
 
   chunk_t chunk;
   chunk.ptr = 300;
@@ -627,11 +595,11 @@ bool test_write_to_chunk_past_end() {
   }
 
   uint64_t data_ptr = chunk.ptr + sizeof(chunk_t);
-  uint64_t block    = data_ptr / handle.block_size;
-  uint64_t offset   = data_ptr % handle.block_size;
+  uint64_t drive    = data_ptr / handle->drive_size;
+  uint64_t offset   = data_ptr % handle->drive_size;
 
   char *result = malloc(5);
-  _read(handle, block, offset, 5, result);
+  read_from_drive(handle, drive, offset, 5, result);
 
   char *expected = malloc(5);
   expected[0] = 1; expected[1] = 2; expected[2] = 3; expected[3] = 70; expected[4] = 71;
@@ -645,88 +613,109 @@ bool test_write_to_chunk_past_end() {
   return true;
 }
 
-bool test_write_to_data_multiblock() {
-  fs_handle handle = init_filesystem(32, 4096);
+bool test_write_to_data_multidrive() {
+  int raid_levels[2] = {5};
+  for (int i = 0; i < 2; i++) {
+    fs_handle *handle = init_filesystem(32, 4000, raid_levels[i]);
 
-  // Chunk A (spans 2 blocks)
-  chunk_t A = { .ptr = 1000, .size = 6000 };
-  // Chunk B (another block-spanning chunk)
-  chunk_t B = { .ptr = 9000, .size = 3000 };
+    const int Asize = 6000;
+    const int Bsize = 3000;
+    uint64_t Coffset = 4000;
+    uint64_t Csize = 3000;
 
-  // Prepare data
-  char *Adata = malloc(6000);
-  char *Bdata = malloc(3000);
-  for (int i = 0; i < 6000; i++) {
-    Adata[i] = (char)(i & 0xFF);
-  }
-  for (int i = 0; i < 3000; i++) {
-    Bdata[i] = (char)(50 + (i & 0x1F));
-  }
+    const uint64_t Aptr = 1000 / handle->stripe_size * handle->stripe_size; // 3000
+    const uint64_t Bptr = 9000 / handle->stripe_size * handle->stripe_size; // 9000
 
-  // Round-trip write and verify write_chunk():
-  if (write_chunk(handle, A, Adata) != 0) {
-    return false;
-  }
-  if (append_to_data(handle, A.ptr, B, Bdata) != 0) {
-    return false;
-  }
+    // Chunk A (spans 2 blocks)
+    chunk_t A = { .ptr = Aptr, .size = Asize };
+    // Chunk B (another drive-spanning chunk)
+    chunk_t B = { .ptr = Bptr, .size = Bsize };
 
-  // New data that will cross A → B boundary
-  char *newdata = malloc(3000);
-  for (int i = 0; i < 3000; i++) {
-    newdata[i] = (char)(200 + (i & 0x3F));
-  }
 
-  // Write starting 1000 bytes before end of A (1000 in A, 2000 in B)
-  uint64_t rc = write_to_data(handle, (chunk_t) {.ptr = A.ptr, .size = 3000}, newdata, 5000);
-  if (rc != 3000) {
-    return false;
-  }
+    // Prepare data
+    char *Adata = malloc(Asize);
+    char *Bdata = malloc(Bsize);
+    for (int i = 0; i < Asize; i++) {
+      Adata[i] = (char)(i & 0xFF);
+    }
+    for (int i = 0; i < Bsize; i++) {
+      Bdata[i] = (char)(50 + (i & 0x1F));
+    }
 
-  // Verify A
-  char *Aread = malloc(6000);
-  read_chunk(handle, A, Aread, 0);
-
-  for (int i = 0; i < 5000; i++) {
-    if (Aread[i] != Adata[i]) {
+    // Round-trip write and verify write_chunk():
+    if (write_chunk(handle, A, Adata) != 0) {
+      printf("Failed write_chunk\n");
       return false;
     }
-  }
 
-  for (int i = 0; i < 1000; i++) {
-    if (Aread[5000 + i] != newdata[i]) {
+    if (append_to_data(handle, A.ptr, B, Bdata) != 0) {
+      printf("Failed append_to_data\n");
       return false;
     }
-  }
 
-  // Verify B
-  char *Bread = malloc(3000);
-  read_chunk(handle, B, Bread, 0);
+    // New data that will cross A → B boundary
+    char *newdata = malloc(Bsize);
+    for (int i = 0; i < Bsize; i++) {
+      newdata[i] = (char)(200 + (i & 0x3F));
+    }
 
-  for (int i = 0; i < 2000; i++) {
-    if (Bread[i] != newdata[1000 + i]) {
+    // Write starting 1000 bytes before end of A (1000 in A, 2000 in B)
+    uint64_t rc = write_to_data(handle, (chunk_t) {.ptr = A.ptr, .size = Csize}, newdata, Coffset);
+    if (rc != Csize) {
+      printf("Failed write_to_data\n");
       return false;
     }
-  }
 
-  for (int i = 2000; i < 3000; i++) {
-    if (Bread[i] != Bdata[i]) {
-      return false;
+    // Verify A
+    char *Aread = malloc(Asize);
+    read_chunk(handle, A, Aread, 0);
+
+    for (int i = 0; i < Coffset; i++) {
+      if (Aread[i] != Adata[i]) {
+        printf("Data read incorrectly (1) at site %li\n", i);
+        return false;
+      }
     }
-  }
 
-  free(Adata);
-  free(Bdata);
-  free(newdata);
-  free(Aread);
-  free(Bread);
-  free_handle(handle);
+    for (int i = 0; i < Asize - Coffset; i++) {
+      if (Aread[Coffset + i] != newdata[i]) {
+        printf("Data read incorrectly (2) at site %li\n", i);
+        return false;
+      }
+    }
+
+    // Verify B
+    char *Bread = malloc(Bsize);
+    read_chunk(handle, B, Bread, 0);
+
+    // Overlap with A:
+    for (int i = 0; i < Csize - Asize + Coffset; i++) {
+      if (Bread[i] != newdata[Asize - Coffset + i]) {
+        printf("Data read incorrectly (3) at site %li Coffset = %li. j = %li\n", i, Coffset, Asize - Coffset + i);
+        return false;
+      }
+    }
+
+    for (int i = Bsize - Asize + Coffset; i < Bsize; i++) {
+      if (Bread[i] != Bdata[i]) {
+        printf("Data read incorrectly (4) at site %li\n", i);
+        return false;
+      }
+    }
+
+    free(Adata);
+    free(Bdata);
+    free(newdata);
+    free(Aread);
+    free(Bread);
+    free_handle(handle);
+  }
 
   return true;
 }
 
-bool test_read_data_multiblock() {
-  fs_handle handle = init_filesystem(32, 4096);
+bool test_read_data_multidrive() {
+  fs_handle *handle = init_filesystem(32, 4096, 0);
 
   chunk_t A = { .ptr = 2000,  .size = 7000 };
   chunk_t B = { .ptr = 13000, .size = 4000 };
@@ -1098,7 +1087,7 @@ bool test_rbtree_successor_predecessor() {
 
 // Augmentation: compute max size in subtree
 bool test_rbtree_augmented_max_size() {
-  rb_tree *t = create_block_file_rbtree(1000);
+  rb_tree *t = create_chunk_file_rbtree(1000);
   if (!t) {
     return false;
   }
@@ -1109,7 +1098,7 @@ bool test_rbtree_augmented_max_size() {
 
   // Insert blocks
   for (int i = 0; i < n_blocks; i++) {
-    make_block(i*100, sizes[i], &nodes[i]);
+    make_chunk(i*100, sizes[i], &nodes[i]);
 
     nodes[i]->augmented = malloc(sizeof(chunk_aug_t));
     chunk_aug_t *w = malloc(sizeof(chunk_aug_t));
@@ -1120,14 +1109,12 @@ bool test_rbtree_augmented_max_size() {
     rb_insert(t, data, w);
   }
 
-  //print_tree(t);
-
   // Check root's max_size
   chunk_aug_t *root_aug = (chunk_aug_t *)t->root->augmented;
   int expected_max = 50;
   ASSERT(root_aug->max_size = expected_max);
 
-  // Delete the block with size 50
+  // Delete the drive with size 50
   rb_delete(t, nodes[3]->data);
 
   root_aug = (chunk_aug_t *)t->root->augmented;
@@ -1176,7 +1163,7 @@ bool compare_nodes(rb_node *a, rb_node *b) {
 
 bool test_rbtree_serialize() {
   // Create first tree
-  rb_tree *t1 = create_block_file_rbtree(1024);
+  rb_tree *t1 = create_chunk_file_rbtree(1024);
   uint64_t* metadata = malloc(sizeof(uint64_t)); 
   *metadata = 42;
   t1->metadata = (void*)metadata;  
@@ -1195,7 +1182,7 @@ bool test_rbtree_serialize() {
   }
 
   // Deserialize into new tree
-  rb_tree *t2 = create_block_file_rbtree(1024);
+  rb_tree *t2 = create_chunk_file_rbtree(1024);
   int res = rb_deserialize(t2, buffer, buf_size, t1->less, t1->update_aug);
   if (res != ISUCCESS) {
     free(buffer);
@@ -1265,9 +1252,9 @@ void traverse(rb_node *node, uint64_t total_width, bool *freed) {
 
   traverse(node->left, total_width, freed);
 
-  chunk_t *block = (chunk_t *)node->data;
-  uint64_t ptr  = block->ptr;
-  uint64_t size = block->size;
+  chunk_t *drive = (chunk_t *)node->data;
+  uint64_t ptr  = drive->ptr;
+  uint64_t size = drive->size;
 
   uint64_t end = ptr + size;
   if (end > total_width) {
@@ -1299,7 +1286,7 @@ bool test_rbtree_malloc_randomized() {
     srand(seed);
 
     uint64_t total_size = 100;
-    rb_tree *t = create_block_file_rbtree(total_size);
+    rb_tree *t = create_chunk_file_rbtree(total_size);
 
     bool *freed = malloc(total_size*sizeof(bool));
     for (int i = 0; i < total_size; i++) {
@@ -1349,7 +1336,7 @@ bool test_rbtree_malloc_randomized() {
 
 bool test_rbtree_mfree_basic() {
   uint64_t total_size = 10;
-  rb_tree *t = create_block_file_rbtree(total_size);
+  rb_tree *t = create_chunk_file_rbtree(total_size);
   rb_malloc(t, 0, total_size);
 
   bool *freed = malloc(total_size*sizeof(bool));
@@ -1395,7 +1382,7 @@ bool test_rbtree_mfree_randomized() {
     srand(seed);
 
     uint64_t total_size = 100;
-    rb_tree *t = create_block_file_rbtree(total_size);
+    rb_tree *t = create_chunk_file_rbtree(total_size);
     rb_malloc(t, 0, total_size);
 
     bool *freed = malloc(total_size*sizeof(bool));
@@ -1450,7 +1437,7 @@ bool test_rbtree_free_ptr() {
     srand(seed);
 
     uint64_t total_size = 100;
-    rb_tree *t = create_block_file_rbtree(total_size);
+    rb_tree *t = create_chunk_file_rbtree(total_size);
 
     bool *freed = malloc(total_size*sizeof(bool));
     for (int i = 0; i < total_size; i++) {
@@ -1570,73 +1557,235 @@ bool test_get_subdirectories() {
   return true;
 }
 
-void print_storage(char **storage, int num_blocks, int block_size) {
-  for (int k = 0; k < num_blocks; k++) {
-    for (int i = 0; i < block_size; i++) {
+bool test_read_write_inode() {
+  int raid_levels[2] = {0, 5};
+  for (int i = 0; i < 2; i++) {
+    int raid_level = raid_levels[i];
+    fs_handle *handle = init_filesystem(20, 2048, raid_level);
+
+    uint64_t node_ptr = 100;
+    inode *node1 = create_inode(5, 10, 100, 100);
+    node1->ptr = 3;
+
+    write_inode(handle, node1, node_ptr);
+
+    inode *node2 = read_inode(handle, node_ptr);
+
+    ASSERT(inodes_equal(node1, node2));
+  }
+
+  return true;
+}
+
+void print_storage(char **storage, int num_drives, int drive_size) {
+  for (int k = 0; k < num_drives; k++) {
+    for (int i = 0; i < drive_size; i++) {
       printf("%i ", storage[k][i]);
     } printf("\n");
   }
 }
 
 bool test_create_file() {
-  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  int raid_levels[2] = {5};
+  for (int i = 0; i < 2; i++) {
+    fs_handle *handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE, raid_levels[i]);
 
-  uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
-  uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
-  uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
+    uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
+    uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
+    uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
 
-  inode *node1 = read_inode(handle, node1_ptr);
-  inode *node3 = read_inode(handle, node3_ptr);
+    inode *node1 = read_inode(handle, node1_ptr);
+    inode *node3 = read_inode(handle, node3_ptr);
 
-  inode *root = read_inode(handle, ROOT_NODE);
-  char *content = read_inode_content(handle, root);
+    inode *root = read_inode(handle, ROOT_NODE);
+    char *content = read_inode_content(handle, root);
 
-  uint64_t *inode_numbers;
-  char **subdirs = get_subdirectories(content, root->size, &inode_numbers);
-  ASSERT(strcmp(subdirs[0], "testing1") == 0);
-  ASSERT(strcmp(subdirs[1], "testing3") == 0);
+    uint64_t *inode_numbers;
+    char **subdirs = get_subdirectories(content, root->size, &inode_numbers);
+    ASSERT(strcmp(subdirs[0], "testing1") == 0);
+    ASSERT(strcmp(subdirs[1], "testing3") == 0);
 
 
-  ASSERT(inodes_equal(read_inode(handle, inode_numbers[0]), node1), "Failed node comparison.");
-  ASSERT(inodes_equal(read_inode(handle, inode_numbers[1]), node3), "Failed node comparison.");
+    ASSERT(inodes_equal(read_inode(handle, inode_numbers[0]), node1), "Failed node comparison.");
+    ASSERT(inodes_equal(read_inode(handle, inode_numbers[1]), node3), "Failed node comparison.");
 
-  content = read_inode_content(handle, node1);
-  subdirs = get_subdirectories(content, node1->size, &inode_numbers);
-  ASSERT(strcmp(subdirs[0], "testing2") == 0);
+    content = read_inode_content(handle, node1);
+    subdirs = get_subdirectories(content, node1->size, &inode_numbers);
+    ASSERT(strcmp(subdirs[0], "testing2") == 0);
 
-  free(inode_numbers);
-  free(content);
-  free(subdirs);
+    free(inode_numbers);
+    free(content);
+    free(subdirs);
 
-  free(root);
-  free(node1);
-  free(node3);
+    free(root);
+    free(node1);
+    free(node3);
 
-  free_handle(handle);
+    free_handle(handle);
+  }
 
   return true;
 }
 
 bool test_find_inode() {
-  fs_handle handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE);
+  int raid_levels[2] = {0, 5};
+  for (int i = 0; i < 2; i++) {
+    fs_handle *handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE, raid_levels[i]);
 
-  uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
-  uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
-  uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
-  char *success = "success";
-  uint64_t node4_ptr = make_file(handle, node2_ptr,  "target", success, strlen(success));
+    uint64_t node1_ptr = make_directory(handle, ROOT_NODE,  "testing1");
+    uint64_t node2_ptr = make_directory(handle, node1_ptr, "testing2");
+    uint64_t node3_ptr = make_directory(handle, ROOT_NODE,  "testing3");
+    char *success = "success";
+    uint64_t node4_ptr = make_file(handle, node2_ptr,  "target", success, strlen(success));
 
-  uint64_t node_ptr;
-  inode *target = find_inode(handle, "/testing1/testing2/target", &node_ptr);
-  char *content = read_inode_content(handle, target);
+    uint64_t node_ptr;
+    inode *target = find_inode(handle, "/testing1/testing2/target", &node_ptr);
+    char *content = read_inode_content(handle, target);
 
-  ASSERT(strcmp(content, success) == 0);
+    ASSERT(strcmp(content, success) == 0);
 
-  free_handle(handle);
+    free_handle(handle);
+  }
 
   return true;
 }
 
+bool test_virtual_ptrs() {
+  // RAID-4
+  {
+    fs_handle *handle = init_filesystem(4, 32, 4);
+    uint64_t s = 4;
+    handle->stripe_size = s;
+
+    int drives[24] =  {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2};
+    int stripes[24] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7};
+
+    for (uint64_t ptr = 0; ptr < 24*s; ptr++) {
+      uint64_t drive, offset;
+      get_drive_and_offset(handle, ptr, &drive, &offset);
+      if (drive != drives[ptr/s]) {
+        printf("Mismatched drive at ptr = %li. drive = %li, drives[ptr] = %li\n", ptr, drive, drives[ptr/s]);
+        return false;
+      }
+
+      uint64_t stripe = offset / handle->stripe_size;
+      if (stripe != stripes[ptr/s]) {
+        printf("Mismatched stripe at ptr = %li. stripe = %li, stripes[ptr] = %li\n", ptr, stripe, stripes[ptr/s]);
+        return false;
+      }
+    }
+
+    free(handle);
+  }
+
+  // RAID-5
+  {
+    printf("RAID 5\n");
+    fs_handle *handle = init_filesystem(4, 32, 5);
+    uint64_t s = 4;
+    handle->stripe_size = s;
+
+    int drives[24] =  {0, 1, 2, 0, 1, 3, 
+                       0, 2, 3, 1, 2, 3, 
+                       0, 1, 2, 0, 1, 3, 
+                       0, 2, 3, 1, 2, 3};
+
+    int stripes[24] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7};
+
+    for (uint64_t ptr = 0; ptr < 24*s; ptr++) {
+      uint64_t drive, offset;
+      get_drive_and_offset(handle, ptr, &drive, &offset);
+      if (drive != drives[ptr/s]) {
+        printf("Mismatched drive at ptr = %li. drive = %li, drives[ptr] = %li\n", ptr/s, drive, drives[ptr/s]);
+        return false;
+      }
+
+      uint64_t stripe = offset / handle->stripe_size;
+      if (stripe != stripes[ptr/s]) {
+        printf("Mismatched stripe at ptr = %li. stripe = %li, stripes[ptr] = %li\n", ptr/s, stripe, stripes[ptr/s]);
+        return false;
+      }
+    }
+
+    free(handle);
+  }
+
+
+  return true;
+}
+
+bool test_parity_chunk() {
+  int raid_level = 5;
+  fs_handle *handle = init_filesystem(NUM_BLOCKS, BLOCK_SIZE, raid_level);
+  uint64_t size = 1000;
+  uint64_t ptr  = handle->stripe_size * 20;
+  char *content = malloc(size);
+  for (uint64_t i = 0; i < size; i++) {
+    content[i] = rand() % 32 + 92;
+  }
+
+  chunk_t hdr = {.ptr = ptr, .size = size};
+  write_chunk(handle, hdr, content);
+  free(content);
+
+  uint64_t node_ptr = make_directory(handle, ROOT_NODE, "testing");
+
+  uint64_t num_stripes = handle->drive_size / handle->stripe_size;
+  for (uint64_t stripe = 0; stripe < num_stripes; stripe++) {
+    check_parity(handle, stripe);
+  }
+
+  return true;
+}
+
+bool test_raid_repair_drive_basic() {
+  for (int k = 0; k < 20; k++) {
+    int raid_level = rand() % 2 + 4;
+    printf("raid_level = %i\n", raid_level);
+    fs_handle *handle = init_filesystem(30, 4000, raid_level);
+
+    uint64_t buffer_size = rand() % 50000 + 5000;
+    char *buffer = malloc(buffer_size);
+    for (int i = 0; i < buffer_size; i++) {
+      buffer[i] = rand() % 32 + 92;
+    }
+
+    uint64_t ptr = rand() % 50000;
+
+    chunk_t hdr = {.ptr = ptr, .size = buffer_size};
+
+    write_chunk(handle, hdr, buffer);
+
+    uint64_t failed_drive = rand() % handle->num_drives;
+
+    char *buffer_after = malloc(buffer_size);
+    simulate_drive_failure(handle, failed_drive);
+    read_chunk(handle, hdr, buffer_after, 0);
+
+    bool failed = false;
+    for (int i = 0; i < buffer_size; i++) {
+      if (buffer[i] != buffer_after[i]) {
+        failed = true;
+        break;
+      }
+    }
+
+    if (!failed) {
+      printf("Simulating drive failure did not corrupt data.\n");
+      return false;
+    }
+
+    repair_failed_drive(handle, failed_drive);
+    read_chunk(handle, hdr, buffer_after, 0);
+    for (int i = 0; i < buffer_size; i++) {
+      if (buffer[i] != buffer_after[i]) {
+        printf("Corruption at site %li\n", i);
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 static const char *_GREEN = "\033[1;32m";
 static const char *_RED   = "\033[1;31m";
@@ -1671,9 +1820,8 @@ int main(int argc, char *argv[]) {
   ADD_TEST(test_write_to_chunk_middle);
   ADD_TEST(test_write_to_chunk_exact_end);
   ADD_TEST(test_write_to_chunk_past_end);
-  ADD_TEST(test_write_to_data_multiblock);
-  ADD_TEST(test_read_data_multiblock);
-
+  ADD_TEST(test_write_to_data_multidrive);
+  ADD_TEST(test_read_data_multidrive);
   
   // rbtree basics
   ADD_TEST(test_rbtree_basic);
@@ -1685,15 +1833,21 @@ int main(int argc, char *argv[]) {
   ADD_TEST(test_rbtree_serialize);
 
   // rbtree filesystem allocation/free
-  //ADD_TEST(test_rbtree_malloc_randomized);
-  //ADD_TEST(test_rbtree_mfree_basic);
-  //ADD_TEST(test_rbtree_mfree_randomized);
-  //ADD_TEST(test_rbtree_free_ptr);
+  ADD_TEST(test_rbtree_malloc_randomized);
+  ADD_TEST(test_rbtree_mfree_basic);
+  ADD_TEST(test_rbtree_mfree_randomized);
+  ADD_TEST(test_rbtree_free_ptr);
 
-  //// Directory traversal
-  //ADD_TEST(test_get_subdirectories);
-  //ADD_TEST(test_create_file);
-  //ADD_TEST(test_find_inode);
+  // Directory traversal
+  ADD_TEST(test_get_subdirectories);
+  ADD_TEST(test_read_write_inode);
+  ADD_TEST(test_create_file);
+  ADD_TEST(test_find_inode);
+
+  // RAID tests
+  ADD_TEST(test_virtual_ptrs);
+  ADD_TEST(test_parity_chunk);
+  ADD_TEST(test_raid_repair_drive_basic);
 
   if (tests.size == 0) {
     printf("No tests to run.\n");

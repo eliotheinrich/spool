@@ -10,7 +10,7 @@ int rank, world_size;
 char original_cwd[1024];
 
 typedef struct {
-  fs_handle handle;
+  fs_handle *handle;
   mpi_request_t req;
   int source;
 } worker_args_t;
@@ -22,12 +22,16 @@ void *handle_read_thread(void *arg) {
 
   char *buffer = malloc(size);
   if (!buffer) {
+    // TODO send failure signal
+    printf("Failed to malloc buffer.\n");
     free(w);
     return NULL;
   }
 
-  FILE *fp = fopen(w->handle.file_path, "r+b");
+  FILE *fp = fopen(w->handle->file_path, "r+b");
   if (!fp) {
+    // TODO send failure signal
+    printf("Failed to open file! file_path = %s\n", w->handle->file_path);
     free(buffer);
     free(w);
     return NULL;
@@ -59,7 +63,7 @@ void *handle_write_thread(void *arg) {
   MPI_Status status;
   MPI_Recv(buffer, size, MPI_BYTE, w->source, w->req.req_id + 30000, MPI_COMM_WORLD, &status); // tag 1 = write data
 
-  FILE *fp = fopen(w->handle.file_path, "r+b");
+  FILE *fp = fopen(w->handle->file_path, "r+b");
   if (!fp) {
     free(buffer);
     free(w);
@@ -76,7 +80,7 @@ void *handle_write_thread(void *arg) {
 }
 
 void *listener_thread(void *arg) {
-  fs_handle handle = *(fs_handle*)arg;
+  fs_handle *handle = (fs_handle*)arg;
   MPI_Status status;
 
   while (1) {
@@ -99,14 +103,12 @@ void *listener_thread(void *arg) {
       pthread_t tid;
       if (req.op == OP_READ) {
         //handle_read_thread(w);
-        //pthread_create(&tid, NULL, handle_read_thread, w);
-        thread_pool_submit(handle.pool, handle_read_thread, w, NULL);
+        thread_pool_submit(handle->pool, handle_read_thread, w, NULL);
       } else if (req.op == OP_WRITE) {
         //handle_write_thread(w);
-        //pthread_create(&tid, NULL, handle_write_thread, w);
-        thread_pool_submit(handle.pool, handle_write_thread, w, NULL);
+        thread_pool_submit(handle->pool, handle_write_thread, w, NULL);
       } else if (req.op == OP_WAIT) {
-        thread_pool_wait(handle.pool);
+        thread_pool_wait(handle->pool);
       }
     } else {
       // No work to do; wait another polling cycle.
@@ -116,15 +118,14 @@ void *listener_thread(void *arg) {
   }
 }
 
-
-int handle_requests(fs_handle handle) {
+int handle_requests(fs_handle *handle) {
   pthread_t listener;
-  pthread_create(&listener, NULL, listener_thread, &handle);
+  pthread_create(&listener, NULL, listener_thread, handle);
   pthread_join(listener, NULL);
   return 0;
 }
 
-void send_read_request(uint64_t block, uint64_t offset, uint64_t size, char *buffer) {
+void send_read_request(uint64_t drive, uint64_t offset, uint64_t size, char *buffer) {
   uint32_t req_id = __sync_fetch_and_add(&request_counter, 1);
 
   mpi_request_t req = {
@@ -136,11 +137,11 @@ void send_read_request(uint64_t block, uint64_t offset, uint64_t size, char *buf
 
   uint32_t tag_data = 20000 + req_id;
 
-  MPI_Send(&req, sizeof(req), MPI_BYTE, block + 1, 0, MPI_COMM_WORLD); 
-  MPI_Recv(buffer, size, MPI_BYTE, block + 1, tag_data, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  MPI_Send(&req, sizeof(req), MPI_BYTE, drive + 1, 0, MPI_COMM_WORLD); 
+  MPI_Recv(buffer, size, MPI_BYTE, drive + 1, tag_data, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
-void send_write_request(uint64_t block, uint64_t offset, uint64_t size, const char *buffer) {
+void send_write_request(uint64_t drive, uint64_t offset, uint64_t size, const char *buffer) {
   uint32_t req_id = __sync_fetch_and_add(&request_counter, 1);
   uint32_t tag_data = 30000 + req_id;
   mpi_request_t req = { 
@@ -150,16 +151,16 @@ void send_write_request(uint64_t block, uint64_t offset, uint64_t size, const ch
     .req_id = req_id 
   };
 
-  MPI_Send(&req, sizeof(req), MPI_BYTE, block + 1, 0, MPI_COMM_WORLD); 
-  MPI_Send(buffer, size, MPI_BYTE, block + 1, tag_data, MPI_COMM_WORLD);
+  MPI_Send(&req, sizeof(req), MPI_BYTE, drive + 1, 0, MPI_COMM_WORLD); 
+  MPI_Send(buffer, size, MPI_BYTE, drive + 1, tag_data, MPI_COMM_WORLD);
 }
 
-void send_wait_request(uint64_t block) {
+void send_wait_request(uint64_t drive) {
   mpi_request_t req = {
     .op = OP_WAIT,
   };
 
-  MPI_Send(&req, sizeof(req), MPI_BYTE, block + 1, 0, MPI_COMM_WORLD);
+  MPI_Send(&req, sizeof(req), MPI_BYTE, drive + 1, 0, MPI_COMM_WORLD);
 }
 
 char *path_first(const char *path, char **rest) {
@@ -285,47 +286,286 @@ void remove_element(const char *buffer, size_t size, const char *str, char **out
   *out_size = w;
 }
 
-void _read(fs_handle handle, uint64_t block, uint64_t offset, uint64_t size, char *buffer) {
+void read_from_drive(fs_handle *handle, uint64_t drive, uint64_t offset, uint64_t size, char *buffer) {
 #ifdef MPI
-  send_read_request(block, offset, size, buffer);
+  send_read_request(drive, offset, size, buffer);
 #else
-  memcpy(buffer, handle.storage[block] + offset, size);
+  memcpy(buffer, handle->storage[drive] + offset, size);
 #endif
 }
 
-void _write(fs_handle handle, uint64_t block, uint64_t offset, uint64_t size, const char *buffer) {
+void write_to_drive(fs_handle *handle, uint64_t drive, uint64_t offset, uint64_t size, const char *buffer) {
 #ifdef MPI
-  send_write_request(block, offset, size, buffer);
+  send_write_request(drive, offset, size, buffer);
 #else
-  memcpy(handle.storage[block] + offset, buffer, size);
+  memcpy(handle->storage[drive] + offset, buffer, size);
 #endif
 }
 
-void write_chunk_header(fs_handle handle, uint64_t ptr, chunk_t chunk) {
-  uint64_t block  = ptr / handle.block_size;
-  uint64_t offset = ptr % handle.block_size;
-
-  _write(handle, block, offset, sizeof(chunk_t), (char*)(&chunk));
+static inline uint64_t min(uint64_t a, uint64_t b) {
+  return (a < b) ? a : b;
 }
 
-void read_chunk_header(fs_handle handle, uint64_t ptr, chunk_t *chunk) {
-  uint64_t block  = ptr / handle.block_size;
-  uint64_t offset = ptr % handle.block_size;
-
-  _read(handle, block, offset, sizeof(chunk_t), (char*)chunk);
+uint64_t _num_stripes(uint64_t num_bytes, uint64_t stripe_size) {
+  return (num_bytes + stripe_size - 1) / stripe_size;
 }
 
-void write_inode(fs_handle handle, inode *node, uint64_t ptr) {
-  uint64_t block = ptr / handle.block_size;
-  uint64_t offset = ptr % handle.block_size;
-  _write(handle, block, offset, sizeof(inode), (char*)node);
+void advance_stripe(fs_handle *handle, uint64_t *drive, uint64_t *offset) {
+  (*drive)++;
+  if (*drive == handle->num_drives) {
+    *drive = 0;
+    (*offset) = ((*offset) + handle->stripe_size) % handle->drive_size;
+  }
 }
 
-inode *read_inode(fs_handle handle, uint64_t ptr) {
-  uint64_t block = ptr / handle.block_size;
-  uint64_t offset = ptr % handle.block_size;
+uint64_t get_parity_drive(fs_handle *handle, uint64_t stripe) {
+  if (handle->raid_level == 4) {
+    return handle->num_drives - 1;
+  } else if (handle->raid_level == 5) {
+    return handle->num_drives - stripe % handle->num_drives - 1;
+  }
+}
+
+bool is_parity_stripe(fs_handle *handle, uint64_t drive, uint64_t stripe) {
+  return drive == get_parity_drive(handle, stripe);
+}
+
+// Takes a virtual pointer and sets the physical drive and offset. Physical ptrs should only be used 
+// in write/read_buffer.
+// RAID arrays must account for certain addresses being reserved for parity. These sites
+// should not be included in the virtual address space.
+void get_drive_and_offset(fs_handle *handle, uint64_t ptr, uint64_t *drive, uint64_t *offset) {
+  if (handle->raid_level == 0) {
+    *drive  = ptr / handle->drive_size;
+    *offset = ptr % handle->drive_size;
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) {
+    uint64_t stripe = ptr / (handle->stripe_size * (handle->num_drives - 1));
+    uint64_t inner = ptr % (handle->stripe_size * (handle->num_drives - 1));
+    uint64_t parity_drive = get_parity_drive(handle, stripe);
+    *drive = (ptr / handle->stripe_size) % (handle->num_drives - 1);
+    *drive = (*drive + (*drive >= parity_drive)) % handle->num_drives;
+    *offset = stripe * handle->stripe_size;
+  }
+}
+
+char *compute_stripe_parity(fs_handle *handle, uint64_t stripe) {
+  char *parity = calloc(handle->stripe_size, 1);
+  uint64_t offset = stripe * handle->stripe_size;
+  for (uint64_t drive = 0; drive < handle->num_drives; drive++) {
+    char *buffer = malloc(handle->stripe_size);
+    read_from_drive(handle, drive, offset, handle->stripe_size, buffer);
+    for (int i = 0; i < handle->stripe_size; i++) {
+      parity[i] ^= buffer[i];
+    }
+  }
+
+  return parity;
+}
+
+void recompute_parity(fs_handle *handle, uint64_t stripe) {
+  char *parity = compute_stripe_parity(handle, stripe); // Ideally 0 since the parity stripe is included
+  uint64_t parity_drive = get_parity_drive(handle, stripe);
+
+  char *buffer = malloc(handle->stripe_size); // Now add contents of parity register
+  read_from_drive(handle, parity_drive, stripe * handle->stripe_size, handle->stripe_size, buffer);
+  for (int i = 0; i < handle->stripe_size; i++) {
+    parity[i] ^= buffer[i];
+  }
+
+  // Write the result back to disk
+  write_to_drive(handle, parity_drive, stripe * handle->stripe_size, handle->stripe_size, parity);
+}
+
+int read_buffer(fs_handle *handle, chunk_t chunk, char *buffer) {
+  if (chunk.ptr + chunk.size >= handle->fs_size) {
+    // Overflow; throw an error
+    return -1;
+  }
+
+  // Get physical pointers
+  uint64_t drive, offset;
+  get_drive_and_offset(handle, chunk.ptr, &drive, &offset);
+
+  uint64_t cur_pos = 0;
+  if (handle->raid_level == 0) { 
+    while (cur_pos < chunk.size) {
+      uint64_t drive_offset = offset % handle->drive_size;
+      uint64_t width = min(handle->drive_size - drive_offset, chunk.size - cur_pos);
+      read_from_drive(handle, drive, drive_offset, width, buffer + cur_pos);
+      cur_pos += width;
+      drive++;
+      offset += width;
+    }
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) { 
+    while (cur_pos < chunk.size) {
+      uint64_t stripe = offset / handle->stripe_size;
+      if (is_parity_stripe(handle, drive, stripe)) {
+        advance_stripe(handle, &drive, &offset);
+      }
+
+      uint64_t in_stripe = chunk.ptr % handle->stripe_size;
+      uint64_t width = min(handle->stripe_size - in_stripe, chunk.size - cur_pos);
+
+      read_from_drive(handle, drive, offset + in_stripe, width, buffer + cur_pos);
+
+      cur_pos   += width;
+      chunk.ptr += width;
+
+      if ((chunk.ptr % handle->stripe_size) == 0) {
+        advance_stripe(handle, &drive, &offset);
+      }
+    }
+  }
+ 
+  return 0;
+}
+
+int write_buffer(fs_handle *handle, chunk_t chunk, const char *buffer) {
+  if (chunk.ptr + chunk.size >= handle->fs_size) {
+    printf("Overflow!\n");
+    // Overflow; throw an error
+    return -1;
+  }
+
+  // Get physical pointers
+  uint64_t drive, offset;
+  get_drive_and_offset(handle, chunk.ptr, &drive, &offset);
+
+  uint64_t cur_pos = 0;
+  if (handle->raid_level == 0) { 
+    while (cur_pos < chunk.size) {
+      uint64_t drive_offset = offset % handle->drive_size;
+      uint64_t width = min(handle->drive_size - drive_offset, chunk.size - cur_pos);
+      write_to_drive(handle, drive, drive_offset, width, buffer + cur_pos);
+      cur_pos += width;
+      drive++;
+      offset += width;
+    }
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) { 
+    uint64_t num_stripes = _num_stripes(handle->drive_size, handle->stripe_size);
+    bool *stripe_stale = calloc(num_stripes, sizeof(bool));
+    while (cur_pos < chunk.size) {
+      uint64_t stripe = offset / handle->stripe_size;
+      if (is_parity_stripe(handle, drive, stripe)) {
+        advance_stripe(handle, &drive, &offset);
+      }
+
+      uint64_t in_stripe = chunk.ptr % handle->stripe_size;
+      uint64_t width = min(handle->stripe_size - in_stripe, chunk.size - cur_pos);
+
+      write_to_drive(handle, drive, offset + in_stripe, width, buffer + cur_pos);
+      stripe_stale[offset / handle->stripe_size] = true;
+
+      cur_pos   += width;
+      chunk.ptr += width;
+
+      if ((chunk.ptr % handle->stripe_size) == 0) {
+        advance_stripe(handle, &drive, &offset);
+      }
+    }
+
+    // Update parity
+    for (uint64_t stripe = 0; stripe < num_stripes; stripe++) {
+      if (stripe_stale[stripe]) {
+        recompute_parity(handle, stripe);
+      }
+    }
+
+    free(stripe_stale);
+  }
+ 
+  return 0;
+}
+
+void write_chunk_header(fs_handle *handle, uint64_t ptr, chunk_t chunk) {
+  write_buffer(handle, (chunk_t) {.ptr = ptr, .size = sizeof(chunk_t)}, (char*)(&chunk));
+}
+
+void read_chunk_header(fs_handle *handle, uint64_t ptr, chunk_t *chunk) {
+  read_buffer(handle, (chunk_t) {.ptr = ptr, .size = sizeof(chunk_t)}, (char*)chunk);
+}
+
+char *read_parity(fs_handle *handle, uint64_t stripe) {
+  char *parity = malloc(handle->stripe_size);
+  uint64_t parity_drive = get_parity_drive(handle, stripe);
+  read_from_drive(handle, parity_drive, stripe * handle->stripe_size, handle->stripe_size, parity);
+  return parity;
+}
+
+bool check_parity(fs_handle *handle, uint64_t stripe) {
+  char *parity = read_parity(handle, stripe);
+
+  for (uint64_t drive = 0; drive < handle->num_drives; drive++) {
+    if (!is_parity_stripe(handle, drive, stripe)) {
+      char *buffer = malloc(handle->stripe_size);
+      read_from_drive(handle, drive, stripe * handle->stripe_size, handle->stripe_size, buffer);
+      for (int i = 0; i < handle->stripe_size; i++) {
+        parity[i] ^= buffer[i];
+      }
+    }
+  }
+
+  for (int j = 0; j < handle->stripe_size; j++) {
+    if (parity[j]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void simulate_drive_failure(fs_handle *handle, uint64_t drive) {
+#ifdef MPI
+  if (rank == drive + 1) {
+    handle->file_path = init_file("simulated.img", handle->drive_size);
+  }
+#else
+  // Just overwrite since data is transient anyways
+  char *buffer = calloc(handle->stripe_size, 1);
+  uint64_t num_stripes = _num_stripes(handle->drive_size, handle->stripe_size);
+  for (uint64_t stripe = 0; stripe < num_stripes; stripe++) {
+    write_to_drive(handle, drive, stripe * handle->stripe_size, handle->stripe_size, buffer);
+  }
+  free(buffer);
+#endif
+}
+
+void repair_failed_drive(fs_handle *handle, uint64_t drive) {
+  if (handle->raid_level == 0) {
+    return;
+  }
+
+  uint64_t num_stripes = _num_stripes(handle->drive_size, handle->stripe_size);
+  for (uint64_t stripe = 0; stripe < num_stripes; stripe++) {
+    // First, compute parity of all surviving drives
+    char *parity = calloc(handle->stripe_size, 1);
+    for (uint64_t d = 0; d < handle->num_drives; d++) {
+      if (d == drive) {
+        continue;
+      }
+
+      char *buffer = malloc(handle->stripe_size);
+      read_from_drive(handle, d, stripe * handle->stripe_size, handle->stripe_size, buffer);
+      for (int j = 0; j < handle->stripe_size; j++) {
+        parity[j] ^= buffer[j];
+      }
+      free(buffer);
+    }
+
+    // Now, replace damaged data with parity
+    write_to_drive(handle, drive, stripe * handle->stripe_size, handle->stripe_size, parity);
+    free(parity);
+  }
+}
+
+void write_inode(fs_handle *handle, inode *node, uint64_t ptr) {
+  char *buffer = (char*)node;
+  write_buffer(handle, (chunk_t) {.ptr = ptr, .size = sizeof(inode)}, buffer);
+}
+
+inode *read_inode(fs_handle *handle, uint64_t ptr) {
   inode *node = malloc(sizeof(inode));
-  _read(handle, block, offset, sizeof(inode), (char*)node);
+  read_buffer(handle, (chunk_t) {.ptr = ptr, .size = sizeof(inode)}, (char*)node);
   return node;
 }
 
@@ -334,245 +574,46 @@ bool inodes_equal(inode *node1, inode *node2) {
 }
 
 void print_inode(inode *node) {
-  printf("mode = %i, uid = %i, gid = %i, atime = %i, mtime = %i, ctime = %i, ptr = %li, size = %li, link_count = %i\n",
-          node->mode, node->uid, node->gid, node->atime, node->mtime, node->ctime, node->ptr, node->size, node->link_count);
+  if (node) {
+    printf("mode = %i, uid = %i, gid = %i, atime = %i, mtime = %i, ctime = %i, ptr = %li, size = %li, link_count = %i\n",
+            node->mode, node->uid, node->gid, node->atime, node->mtime, node->ctime, node->ptr, node->size, node->link_count);
+  } else {
+    printf("(null)\n");
+  }
 }
 
-// data is formatted according to
-// N P D D D ... N P D D D ...
-// where N is the number of bytes in each block, P is the pointer to the next block, and D is the bytes
-int get_data_ptrs(fs_handle handle, uint64_t ptr, uint64_t size, uint64_t start, uint64_t **ptrs, uint64_t **sizes, uint64_t *nptrs) {
-  if (size == 0) {
-    *nptrs = 0;
-    *ptrs = NULL;
-    *sizes = NULL;
-    return 0;
-  }
-
-  const size_t buffer_step = 20;
-  size_t buffer_size = buffer_step;
-  *ptrs  = malloc(buffer_size*sizeof(uint64_t*));
-  *sizes = malloc(buffer_size*sizeof(uint64_t*)); 
-
-  uint64_t cur_pos = 0;
-  uint64_t read_bytes = 0;
-  int k = 0;
-  while (read_bytes < size) {
-    // For now, assume header fits in current block.
-    uint64_t block = ptr / handle.block_size;
-    uint64_t offset = ptr % handle.block_size;
-
-    chunk_t chunk;
-    read_chunk_header(handle, ptr, &chunk);
-    offset += sizeof(chunk_t);
-
-    uint64_t remaining_chunk_size;
-    uint64_t skip;
-    if (cur_pos + chunk.size < start) {
-      cur_pos += chunk.size;
-      ptr = chunk.ptr;
-      continue;
-    } else if (cur_pos < start) {
-      // start lies somewhere in this chunk
-      // -----------c----------s---------
-      skip = start - cur_pos;
-      remaining_chunk_size = chunk.size - skip;
-    } else {
-      skip = 0;
-      remaining_chunk_size = chunk.size;
-    }
-
-    cur_pos += skip;
-
-    while (remaining_chunk_size > 0) {
-      while (skip + offset > handle.block_size) {
-        block++;
-        cur_pos += handle.block_size;
-        skip -= handle.block_size;
-      }
-
-      uint64_t read_ptr = block * handle.block_size + offset + skip;
-      uint64_t read_size;
-      if (remaining_chunk_size < handle.block_size - offset - skip) {
-        // Can finish reading within this block
-        read_bytes += remaining_chunk_size;
-        cur_pos += remaining_chunk_size;
-
-        read_size = remaining_chunk_size;
-        remaining_chunk_size = 0;
-      } else {
-        // Read as much as possible in this block
-        uint32_t size_left_in_block = handle.block_size - offset - skip;
-        read_bytes += size_left_in_block;
-        offset = 0;
-        remaining_chunk_size -= size_left_in_block;
-        cur_pos += size_left_in_block;
-        block++;
-
-        read_size = size_left_in_block;
-      }
-
-      skip = 0;
-
-      (*ptrs)[k] = read_ptr;
-      (*sizes)[k] = read_size;
-      k++;
-
-      // Reallocate
-      if (k >= buffer_size) {
-        buffer_size += buffer_step;
-        *ptrs  = realloc(*ptrs,  buffer_size*sizeof(uint64_t));
-        *sizes = realloc(*sizes, buffer_size*sizeof(uint64_t));
-      }
-
-      // Read outside of bounds. Exit.
-      if (block >= handle.num_blocks) {
-        free(*ptrs);
-        free(*sizes);
-        return -1;
-      }
-    }
-
-    ptr = chunk.ptr;
-  }
-
-  *ptrs  = realloc(*ptrs,  k*sizeof(uint64_t));
-  *sizes = realloc(*sizes, k*sizeof(uint64_t));
-  *nptrs = k;
-
-  return 0;
-}
-
-struct block_job {
-  fs_handle handle;
+struct drive_job {
+  fs_handle *handle;
   uint64_t start;
-  uint64_t block;
+  uint64_t drive;
   uint64_t offset;
   uint64_t size;
   char *buffer;
 };
 
 void *read_worker(void *arg) {
-  struct block_job *job = arg;
-  _read(job->handle, job->block, job->offset, job->size, job->buffer + job->start);
+  struct drive_job *job = arg;
+  read_from_drive(job->handle, job->drive, job->offset, job->size, job->buffer + job->start);
   return NULL;
 }
 
-int read_data_offset_async(fs_handle handle, char *buffer, uint64_t *ptrs, uint64_t *sizes, uint64_t nptrs) {
-  uint64_t start = 0;
-  struct block_job jobs[nptrs];
-  pthread_t threads[nptrs];
-
-  for (uint64_t i = 0; i < nptrs; i++) {
-    jobs[i].handle = handle;
-    jobs[i].start = start;
-    jobs[i].block = ptrs[i] / handle.block_size;
-    jobs[i].offset = ptrs[i] % handle.block_size;
-    jobs[i].size = sizes[i];
-    jobs[i].buffer = buffer;
-    start += sizes[i];
-  }
-
-  // One thread per job
-  // TODO: limit number of threads by using a thread pool
-  
-  for (uint64_t i = 0; i < nptrs; i++) {
-    //thread_create(&threads[i], NULL, read_worker, &jobs[i]);
-  }
-
-  for (uint64_t i = 0; i < nptrs; i++) {
-    //pthread_join(threads[i], NULL);
-    read_worker(&jobs[i]);
-  }
-  
-  return 0;
-}
-
-int read_data_offset_serial(fs_handle handle, char *buffer, uint64_t *ptrs, uint64_t *sizes, uint64_t nptrs) {
-  uint64_t start = 0;
-  for (uint64_t i = 0; i < nptrs; i++) {
-    uint64_t block  = ptrs[i] / handle.block_size;
-    uint64_t offset = ptrs[i] % handle.block_size;
-    _read(handle, block, offset, sizes[i], buffer + start);
-    start += sizes[i];
-  }
-
-  return 0;
-}
-
-int read_data_offset(fs_handle handle, uint64_t ptr, uint64_t size, char *buffer, uint64_t start) {
-  if (size == 0) {
-    return 0;
-  }
-
-  uint64_t *ptrs;
-  uint64_t *sizes;
-  uint64_t nptrs;
-  int result = get_data_ptrs(handle, ptr, size, start, &ptrs, &sizes, &nptrs);
-  if (result == -1) {
-    return -1;
-  }
-
-  return read_data_offset_async(handle, buffer, ptrs, sizes, nptrs);
-}
-
-static inline uint64_t min(uint64_t a, uint64_t b) {
-  return (a < b) ? a : b;
-}
-
-int read_buffer(fs_handle handle, chunk_t chunk, char *buffer) {
-  uint64_t block = chunk.ptr / handle.block_size;
-  uint64_t offset = chunk.ptr % handle.block_size;
-
-  uint64_t cur_pos = 0;
-  while (cur_pos < chunk.size) {
-    uint64_t block_offset = offset % handle.block_size;
-    uint64_t width = min(handle.block_size - block_offset, chunk.size - cur_pos);
-    _read(handle, block, block_offset, width, buffer + cur_pos);
-    cur_pos += width;
-    block++;
-    offset += width;
-  }
- 
-  return 0;
-}
-
-int write_buffer(fs_handle handle, chunk_t chunk, const char *buffer) {
-  uint64_t block = chunk.ptr / handle.block_size;
-  uint64_t offset = chunk.ptr % handle.block_size;
-
-  uint64_t cur_pos = 0;
-  while (cur_pos < chunk.size) {
-    uint64_t block_offset = offset % handle.block_size;
-    uint64_t width = min(handle.block_size - block_offset, chunk.size - cur_pos);
-    _write(handle, block, block_offset, width, buffer + cur_pos);
-    cur_pos += width;
-    block++;
-    offset += width;
-  }
- 
-  return 0;
-}
-
-int write_chunk(fs_handle handle, chunk_t chunk, const char *buffer) {
-  uint64_t block = chunk.ptr / handle.block_size;
-  uint64_t offset = chunk.ptr % handle.block_size;
-
+int write_chunk(fs_handle *handle, chunk_t chunk, const char *buffer) {
   // Store header. Next pointer should be dangling (i.e. point to root) initialially
-  write_chunk_header(handle, chunk.ptr, (chunk_t) {.ptr = 0, .size = chunk.size});
-  offset += sizeof(chunk_t);
+  chunk_t c = {.ptr = 0, .size = chunk.size};
+  char *hdr = (char*)(&c);
 
-  chunk.ptr = block * handle.block_size + offset;
-  write_buffer(handle, chunk, buffer);
+  uint64_t buffer_size = chunk.size + sizeof(chunk_t);
+  char *tmp = malloc(buffer_size);
+  memcpy(tmp,                   hdr,    sizeof(chunk_t)); // Write header
+  memcpy(tmp + sizeof(chunk_t), buffer, chunk.size);      // Write buffer
+
+  write_buffer(handle, (chunk_t) {.ptr = chunk.ptr, .size = buffer_size}, tmp);
+  free(tmp);
 
   return 0;
 }
 
-uint64_t write_to_chunk(fs_handle handle, chunk_t chunk, const char *buffer, uint64_t offset) {
-  uint64_t buffer_size = chunk.size;
-  uint64_t ptr_block = chunk.ptr / handle.block_size;
-  uint64_t ptr_offset = chunk.ptr % handle.block_size;
-
+uint64_t write_to_chunk(fs_handle *handle, chunk_t chunk, const char *buffer, uint64_t offset) {
   chunk_t c;
   read_chunk_header(handle, chunk.ptr, &c);
 
@@ -580,10 +621,8 @@ uint64_t write_to_chunk(fs_handle handle, chunk_t chunk, const char *buffer, uin
     return 0;
   }
 
-  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t) + offset;
-  ptr_block = data_ptr / handle.block_size;
-  ptr_offset = data_ptr % handle.block_size;
-  chunk.ptr = ptr_block * handle.block_size + ptr_offset;
+  uint64_t buffer_size = chunk.size;
+  chunk.ptr = chunk.ptr + sizeof(chunk_t) + offset;
   chunk.size = min(c.size - offset, buffer_size);
   write_buffer(handle, chunk, buffer);
 
@@ -591,9 +630,9 @@ uint64_t write_to_chunk(fs_handle handle, chunk_t chunk, const char *buffer, uin
 }
 
 // Writes over a chunk starting at chunk.ptr at offset start. The buffer has size chunk.size - offset.
-uint64_t write_to_data(fs_handle handle, chunk_t chunk, const char *buffer, uint64_t offset) {
-  uint64_t ptr = chunk.ptr; // Pointer to header of current chunk
-  uint64_t cur_pos = 0; // Position in chunk-chain
+uint64_t write_to_data(fs_handle *handle, chunk_t chunk, const char *buffer, uint64_t offset) {
+  uint64_t ptr = chunk.ptr;   // Pointer to header of current chunk
+  uint64_t cur_pos = 0;       // Position in chunk-chain
   uint64_t written_bytes = 0; // Number of bytes written
 
   while (written_bytes < chunk.size) {
@@ -608,7 +647,7 @@ uint64_t write_to_data(fs_handle handle, chunk_t chunk, const char *buffer, uint
 
     // Advance the current position in the chain to the end of the current chunk
     cur_pos += c.size;
-    // Advance the ptr the the next chunk 
+    // Advance the ptr to the next chunk 
     ptr = c.ptr;
 
     // Ran out of bytes; return
@@ -621,38 +660,36 @@ uint64_t write_to_data(fs_handle handle, chunk_t chunk, const char *buffer, uint
 }
 
 // Appends to a chunk chain starting at ptr. The destination chunk starts at chunk_dest.ptr and has size chunk_dest.size
-int append_to_data(fs_handle handle, uint64_t ptr, chunk_t chunk_dest, const char *buffer) {
+int append_to_data(fs_handle *handle, uint64_t ptr, chunk_t chunk_dest, const char *buffer) {
   if (chunk_dest.size == 0) {
     return 0;
   }
 
   // Write new chunk location to old dangling pointer location
   uint64_t tail_ptr = get_tail_ptr(handle, ptr);
-  _write(handle, tail_ptr / handle.block_size, tail_ptr % handle.block_size, sizeof(uint64_t), (char*)&chunk_dest.ptr);
+  uint64_t drive, offset;
+  get_drive_and_offset(handle, tail_ptr, &drive, &offset);
+  write_to_drive(handle, drive, offset, sizeof(uint64_t), (char*)&chunk_dest.ptr);
 
   // Write new chunk
   write_chunk(handle, chunk_dest, buffer);
+
   return 0;
 }
 
 // Reads the chunk starting at chunk.ptr. This chunk must have size >= chunk.size
-uint64_t read_chunk(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offset) {
+uint64_t read_chunk(fs_handle *handle, chunk_t chunk, char *buffer, uint64_t offset) {
   uint64_t buffer_size = chunk.size;
-  uint64_t ptr_block = chunk.ptr / handle.block_size;
-  uint64_t ptr_offset = chunk.ptr % handle.block_size;
 
-  chunk_t c;
-  read_chunk_header(handle, chunk.ptr, &c);
+  chunk_t hdr;
+  read_chunk_header(handle, chunk.ptr, &hdr);
 
-  if (offset > c.size) {
+  if (offset > hdr.size) {
     return 0;
   }
 
-  uint64_t data_ptr = chunk.ptr + sizeof(chunk_t) + offset;
-  ptr_block = data_ptr / handle.block_size;
-  ptr_offset = data_ptr % handle.block_size;
-  chunk.ptr = ptr_block * handle.block_size + ptr_offset;
-  chunk.size = min(c.size - offset, buffer_size);
+  chunk.ptr = chunk.ptr + sizeof(chunk_t) + offset;
+  chunk.size = min(hdr.size - offset, buffer_size);
   read_buffer(handle, chunk, buffer);
 
   return chunk.size;
@@ -660,7 +697,7 @@ uint64_t read_chunk(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offs
 
 // Reads the content of a chunk chain, starting at offset start. This chunk starts at chunk.ptr
 // and has size at least chunk.size
-uint64_t read_data(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offset) {
+uint64_t read_data(fs_handle *handle, chunk_t chunk, char *buffer, uint64_t offset) {
   uint64_t ptr = chunk.ptr; // Pointer to header of current chunk
   uint64_t cur_pos = 0; // Position in chunk-chain
   uint64_t read_bytes = 0; // Number of bytes read
@@ -688,10 +725,10 @@ uint64_t read_data(fs_handle handle, chunk_t chunk, char *buffer, uint64_t offse
   return read_bytes;
 }
 
-char **malloc_blocks(int num_blocks, int block_size) {
-  char **data = calloc(num_blocks, sizeof(char*));
-  for (int i = 0; i < num_blocks; i++) {
-    data[i] = calloc(block_size, 1);
+char **malloc_blocks(int num_drives, int drive_size) {
+  char **data = calloc(num_drives, sizeof(char*));
+  for (int i = 0; i < num_drives; i++) {
+    data[i] = calloc(drive_size, 1);
   }
 
   return data;
@@ -770,7 +807,7 @@ void print_directory_content(char *content, uint64_t content_size) {
   }
 }
 
-char *read_inode_content(fs_handle handle, const inode* node) {
+char *read_inode_content(fs_handle *handle, const inode* node) {
   if (!node) {
     return NULL;
   }
@@ -780,18 +817,18 @@ char *read_inode_content(fs_handle handle, const inode* node) {
   return buffer;
 }
 
-char *init_file(uint64_t block_size) {
+char *init_file(char *filename, uint64_t drive_size) {
   if (rank == 0) {
     return NULL;
   }
 
-  char *filename = malloc(2048);
-  snprintf(filename, 2048, "%s/storage%i.img", original_cwd, rank);
-  printf("Loading file %s\n", filename);
+  char *path = malloc(2048);
+  snprintf(path, 2048, "%s/%s", original_cwd, filename);
 
   FILE *fp = fopen(filename, "w+b");
+  printf("Creating file %s\n", filename);
   fp = fopen(filename, "w+b");
-  fseek(fp, block_size - 1, SEEK_SET);
+  fseek(fp, drive_size - 1, SEEK_SET);
   fputc(0, fp);
 
   fclose(fp);
@@ -799,20 +836,22 @@ char *init_file(uint64_t block_size) {
   return filename;
 }
 
-char *setup_file(uint64_t block_size) {
+char *acquire_file(char *filename, uint64_t drive_size) {
   if (rank == 0) {
     return NULL;
   }
 
-  char *filename = malloc(2048);
-  snprintf(filename, 2048, "%s/storage%i.img", original_cwd, rank);
-  printf("Loading file %s\n", filename);
+  char *path = malloc(2048);
+  snprintf(path, 2048, "%s/%s", original_cwd, filename);
 
   FILE *fp = fopen(filename, "r+b");
   if (!fp) {
+    printf("Creating file %s\n", filename);
     fp = fopen(filename, "w+b");
-    fseek(fp, block_size - 1, SEEK_SET);
+    fseek(fp, drive_size - 1, SEEK_SET);
     fputc(0, fp);
+  } else {
+    printf("Loading file %s\n", filename);
   }
 
   fclose(fp);
@@ -851,7 +890,7 @@ rb_tree *acquire_rbtree(size_t width, bool *found_tree) {
     char *buffer = read_file(fp, &size);
     fclose(fp);
 
-    int result = rb_deserialize(t, buffer, size, block_less_by_ptr, update_max_size);
+    int result = rb_deserialize(t, buffer, size, chunk_less_by_ptr, update_max_size);
     uint64_t serialized_width = *(uint64_t*)t->metadata;
     print_tree(t);
     if (result == ISUCCESS && width == serialized_width) {
@@ -862,7 +901,7 @@ rb_tree *acquire_rbtree(size_t width, bool *found_tree) {
   } 
 
   *found_tree = false;
-  return create_block_file_rbtree(width);
+  return create_chunk_file_rbtree(width);
 }
 
 void set_timestamp(inode *node, const struct timespec tv[2]) {
@@ -871,8 +910,39 @@ void set_timestamp(inode *node, const struct timespec tv[2]) {
   node->ctime = time(NULL);
 }
 
-void append_root(fs_handle handle) {
-  if (!handle.t) {
+void get_free_ptr(fs_handle *handle, uint64_t size, uint64_t *ptr) {
+  if (handle->raid_level == 0) {
+    rb_get_free_ptr(handle->t, size, ptr);
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) {
+    // Need to map allocated ptr in RB-tree back to physical bytes
+    uint64_t num_stripes = _num_stripes(size, handle->stripe_size);
+    rb_get_free_ptr(handle->t, num_stripes, ptr);
+    (*ptr) *= handle->stripe_size; // Returned pointer is in units of stripes. Convert to bytes.
+  }
+}
+
+// When storing data in RAID arrays, the internal RB-tree accounts for data in blocks of size
+// handle->stripe_size. Therefore, ptr and size must be appropriately transformed.
+void fs_malloc(fs_handle *handle, uint64_t ptr, uint64_t size) {
+  if (handle->raid_level == 0) {
+    rb_malloc(handle->t, ptr, size); 
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) {
+    uint64_t num_stripes = _num_stripes(size, handle->stripe_size) ;
+    rb_malloc(handle->t, ptr / handle->stripe_size, num_stripes);
+  }
+}
+
+void fs_mfree(fs_handle *handle, uint64_t ptr, uint64_t size) {
+  if (handle->raid_level == 0) {
+    rb_mfree(handle->t, ptr, size);
+  } else if (handle->raid_level == 4 || handle->raid_level == 5) {
+    uint64_t num_stripes = _num_stripes(size, handle->stripe_size);
+    rb_mfree(handle->t, ptr / handle->stripe_size, num_stripes);
+  }
+}
+
+void append_root(fs_handle *handle) {
+  if (!handle->t) {
     return;
   }
 
@@ -887,29 +957,42 @@ void append_root(fs_handle handle) {
   root->mtime = 0;
   root->ctime = time(NULL);
 
-  rb_malloc(handle.t, ROOT_NODE, sizeof(inode));
+  uint64_t inode_size = sizeof(inode);
+  fs_malloc(handle, ROOT_NODE, inode_size);
   write_inode(handle, root, ROOT_NODE);
 
   free(root);
 }
 
-fs_handle acquire_filesystem(uint64_t num_blocks, uint64_t block_size) {
-  fs_handle handle;
-  handle.num_blocks = num_blocks;
-  handle.block_size = block_size;
-  handle.pool = malloc(sizeof(thread_pool));
-  thread_pool_init(handle.pool, 4);
+fs_handle *acquire_filesystem(uint64_t num_drives, uint64_t drive_size, int raid_level) {
+  fs_handle *handle = malloc(sizeof(fs_handle));
+  handle->num_drives = num_drives;
+  handle->drive_size = drive_size;
+  handle->raid_level = raid_level;
+  handle->stripe_size = sizeof(inode);
+
+  handle->pool = malloc(sizeof(thread_pool));
+  thread_pool_init(handle->pool, 4);
   
   bool skip_append;
 #ifdef MPI
   printf("Using MPI!\n");
-  handle.file_path = setup_file(block_size);
+  char *filename = malloc(2048);
+  snprintf(filename, 2048, "storage%i.img", rank);
+  handle->file_path = acquire_file(filename, drive_size);
 #else
   printf("Using non-MPI!\n");
-  handle.storage = malloc_blocks(num_blocks, block_size);
+  handle->storage = malloc_blocks(num_drives, drive_size);
 #endif
 
-  handle.t = acquire_rbtree(num_blocks * block_size, &skip_append);
+  handle->fs_size = num_drives * drive_size;
+  uint64_t rbtree_size = handle->fs_size;
+  if (handle->raid_level == 4 || handle->raid_level == 5) {
+    uint64_t num_stripes = _num_stripes(handle->drive_size, handle->stripe_size);
+    // num_stripes must be allocated to parity bytes and so are unavailable as storage space.
+    rbtree_size = handle->fs_size / handle->stripe_size - num_stripes;
+  }
+  handle->t = acquire_rbtree(rbtree_size, &skip_append);
 
   if (!skip_append) {
     append_root(handle);
@@ -918,35 +1001,46 @@ fs_handle acquire_filesystem(uint64_t num_blocks, uint64_t block_size) {
   return handle;
 }
 
-fs_handle init_filesystem(uint64_t num_blocks, uint64_t block_size) {
-  fs_handle handle;
-  handle.num_blocks = num_blocks;
-  handle.block_size = block_size;
-  handle.pool = malloc(sizeof(thread_pool));
-  thread_pool_init(handle.pool, 4);
+fs_handle *init_filesystem(uint64_t num_drives, uint64_t drive_size, int raid_level) {
+  fs_handle *handle = malloc(sizeof(fs_handle));
+  handle->num_drives = num_drives;
+  handle->drive_size = drive_size;
+  handle->raid_level = raid_level;
+  handle->stripe_size = sizeof(inode);
+
+  handle->pool = malloc(sizeof(thread_pool));
   
 #ifdef MPI
   printf("Using MPI!\n");
-  handle.file_path = init_file(block_size);
+  char *filename = malloc(2048);
+  snprintf(filename, 2048, "storage%i.img", rank);
+  handle->file_path = init_file(filename, drive_size);
+  thread_pool_init(handle->pool, 4);
 #else
   printf("Using non-MPI!\n");
-  handle.storage = malloc_blocks(num_blocks, block_size);
+  handle->storage = malloc_blocks(num_drives, drive_size);
 #endif
-
-  handle.t = create_block_file_rbtree(num_blocks * block_size);
+  
+  handle->fs_size = num_drives * drive_size;
+  uint64_t rbtree_size = handle->fs_size;
+  if (handle->raid_level == 4 || handle->raid_level == 5) {
+    uint64_t num_stripes = _num_stripes(handle->drive_size, handle->stripe_size);
+    rbtree_size = handle->fs_size / handle->stripe_size - num_stripes;
+  }
+  handle->t = create_chunk_file_rbtree(rbtree_size);
 
   append_root(handle);
 
   return handle;
 }
 
-void free_handle(fs_handle handle) {
-  free(handle.t);
-  thread_pool_shutdown(handle.pool);
+void free_handle(fs_handle *handle) {
+  free(handle->t);
+  //thread_pool_shutdown(handle->pool);
 #ifdef MPI
-  free(handle.file_path);
+  free(handle->file_path);
 #else
-  free(handle.storage);
+  free(handle->storage);
 #endif
 }
 
@@ -963,13 +1057,14 @@ inode *create_inode(uint32_t uid, uint32_t gid, uint32_t mode, uint32_t size) {
 }
 
 // Gets location of the first dangling pointer following a chunk chain starting at ptr
-uint64_t get_tail_ptr(fs_handle handle, uint64_t ptr) {
+uint64_t get_tail_ptr(fs_handle *handle, uint64_t ptr) {
   chunk_t chunk = {.ptr = ptr, .size = 0};
   uint64_t prev_ptr = chunk.ptr;
   read_chunk_header(handle, chunk.ptr, &chunk);
 
   bool valid_ptr = (chunk.ptr != 0);
-  while (valid_ptr) {
+  int k = 0;
+  while (valid_ptr && k++ < 5) {
     prev_ptr = chunk.ptr;
     read_chunk_header(handle, chunk.ptr, &chunk);
     valid_ptr = (chunk.ptr != 0);
@@ -978,18 +1073,18 @@ uint64_t get_tail_ptr(fs_handle handle, uint64_t ptr) {
   return prev_ptr;
 }
 
-int append_to_inode(fs_handle handle, const char *buffer, uint64_t size, uint64_t node_ptr) {
+int append_to_inode(fs_handle *handle, const char *buffer, uint64_t size, uint64_t node_ptr) {
   inode *node = read_inode(handle, node_ptr);
   node->size += size;
 
   if (!node->ptr) {
-    rb_get_free_ptr(handle.t, sizeof(chunk_t) + size, &node->ptr);
-    rb_malloc(handle.t, node->ptr, sizeof(chunk_t) + size);
+    get_free_ptr(handle, sizeof(inode), &node->ptr);
+    fs_malloc(handle, node->ptr, sizeof(inode));
     write_chunk(handle, (chunk_t) {.ptr = node->ptr, .size = size}, buffer);
   } else {
     uint64_t new_ptr;
-    rb_get_free_ptr(handle.t, sizeof(chunk_t) + size, &new_ptr);
-    rb_malloc(handle.t, new_ptr, sizeof(chunk_t) + size);
+    get_free_ptr(handle, size, &new_ptr);
+    fs_malloc(handle, new_ptr, size);
     append_to_data(handle, node->ptr, (chunk_t) {.ptr = new_ptr, .size = size}, buffer);
   }
 
@@ -999,7 +1094,7 @@ int append_to_inode(fs_handle handle, const char *buffer, uint64_t size, uint64_
   return 0;
 }
 
-void add_child(fs_handle handle, const char *filename, uint64_t parent_ptr, uint64_t node_ptr) {
+void add_child(fs_handle *handle, const char *filename, uint64_t parent_ptr, uint64_t node_ptr) {
   // Append directory name to parent's content
   size_t size = strlen(filename) + 1 + sizeof(uint64_t);
   char *content = malloc(size);
@@ -1015,7 +1110,7 @@ void add_child(fs_handle handle, const char *filename, uint64_t parent_ptr, uint
   free(content);
 }
 
-void print_inode_format(fs_handle handle, inode *node) {
+void print_inode_format(fs_handle *handle, inode *node) {
   if (!node) {
     printf("NULL\n");
   }
@@ -1031,22 +1126,23 @@ void print_inode_format(fs_handle handle, inode *node) {
   }
 }
 
-uint64_t make_file(fs_handle handle, uint64_t parent_ptr, const char *name, const char *buffer, uint64_t size) {
+uint64_t make_file(fs_handle *handle, uint64_t parent_ptr, const char *name, const char *buffer, uint64_t size) {
   inode *node = create_inode(0, 0, FILETYPE_FILE, 0);
   node->size = size;
   node->link_count++;
 
   if (size > 0) {
     // Store data
-    rb_get_free_ptr(handle.t, sizeof(chunk_t) + size, &node->ptr);
-    rb_malloc(handle.t, node->ptr, sizeof(chunk_t) + node->size);
+    uint64_t buffer_size = sizeof(chunk_t) + size;
+    get_free_ptr(handle, buffer_size, &node->ptr);
+    fs_malloc(handle, node->ptr, buffer_size);
     write_chunk(handle, (chunk_t) {.ptr = node->ptr, .size = node->size}, buffer);
   }
 
   // Store node
   uint64_t node_ptr;
-  rb_get_free_ptr(handle.t, sizeof(inode), &node_ptr);
-  rb_malloc(handle.t, node_ptr, sizeof(inode));
+  get_free_ptr(handle, sizeof(inode), &node_ptr);
+  fs_malloc(handle, node_ptr, sizeof(inode));
   write_inode(handle, node, node_ptr);
 
   free(node);
@@ -1056,14 +1152,14 @@ uint64_t make_file(fs_handle handle, uint64_t parent_ptr, const char *name, cons
   return node_ptr;
 }
 
-uint64_t make_directory(fs_handle handle, uint64_t parent_ptr, const char *name) {
+uint64_t make_directory(fs_handle *handle, uint64_t parent_ptr, const char *name) {
   inode *node = create_inode(0, 0, FILETYPE_DIR, 0);
   node->link_count++;
 
   // Store node
   uint64_t node_ptr;
-  rb_get_free_ptr(handle.t, sizeof(inode), &node_ptr);
-  rb_malloc(handle.t, node_ptr, sizeof(inode));
+  get_free_ptr(handle, sizeof(inode), &node_ptr);
+  fs_malloc(handle, node_ptr, sizeof(inode));
   write_inode(handle, node, node_ptr);
 
   free(node);
@@ -1073,7 +1169,7 @@ uint64_t make_directory(fs_handle handle, uint64_t parent_ptr, const char *name)
   return node_ptr;
 }
 
-inode *find_inode(fs_handle handle, const char *path, uint64_t *node_ptr) {
+inode *find_inode(fs_handle *handle, const char *path, uint64_t *node_ptr) {
   if (!path) {
     *node_ptr = 0;
     return read_inode(handle, ROOT_NODE);
@@ -1117,16 +1213,17 @@ inode *find_inode(fs_handle handle, const char *path, uint64_t *node_ptr) {
   return node;
 }
 
-void free_chunks(fs_handle handle, uint64_t ptr) {
-  while (ptr) {
+void free_chunks(fs_handle *handle, uint64_t ptr) {
+  uint64_t prev_ptr = ptr;
+  while (prev_ptr) {
     chunk_t chunk;
-    read_chunk_header(handle, ptr, &chunk);
-    rb_mfree(handle.t, chunk.ptr, chunk.size + sizeof(chunk_t));
-    ptr = chunk.ptr;
+    read_chunk_header(handle, prev_ptr, &chunk);
+    fs_mfree(handle, ptr, chunk.size + sizeof(chunk_t));
+    prev_ptr = chunk.ptr;
   }
 }
 
-void replace_inode_content(fs_handle handle, uint64_t node_ptr, const char *buffer, uint64_t size) {
+void replace_inode_content(fs_handle *handle, uint64_t node_ptr, const char *buffer, uint64_t size) {
   inode *node = read_inode(handle, node_ptr);
   free_chunks(handle, node->ptr);
   node->ptr = 0;
@@ -1137,19 +1234,19 @@ void replace_inode_content(fs_handle handle, uint64_t node_ptr, const char *buff
   append_to_inode(handle, buffer, size, node_ptr);
 }
 
-int free_inode(fs_handle handle, uint64_t node_ptr) {
+int free_inode(fs_handle *handle, uint64_t node_ptr) {
   inode *node = read_inode(handle, node_ptr);
 
   // Free data
   free_chunks(handle, node->ptr);
 
   // Free inode metadata
-  rb_mfree(handle.t, node_ptr, sizeof(inode));
+  fs_mfree(handle, node_ptr, sizeof(inode));
 
   return 0;
 }
 
-int remove_directory(fs_handle handle, uint64_t node_ptr) {
+int remove_directory(fs_handle *handle, uint64_t node_ptr) {
   inode *node = read_inode(handle, node_ptr);  
   if (!(node->mode & FILETYPE_DIR)) {
     free(node);
@@ -1159,7 +1256,7 @@ int remove_directory(fs_handle handle, uint64_t node_ptr) {
   return free_inode(handle, node_ptr);
 }
 
-int remove_file(fs_handle handle, uint64_t node_ptr) {
+int remove_file(fs_handle *handle, uint64_t node_ptr) {
   inode *node = read_inode(handle, node_ptr);  
   if (!(node->mode & FILETYPE_FILE)) {
     free(node);
@@ -1168,4 +1265,3 @@ int remove_file(fs_handle handle, uint64_t node_ptr) {
 
   return free_inode(handle, node_ptr);
 }
-
