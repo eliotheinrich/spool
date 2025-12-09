@@ -477,7 +477,7 @@ void rb_free(rb_tree *t) {
   free(t);
 }
 
-chunk_t *make_block(int ptr, int size, rb_node **out_node) {
+chunk_t *make_chunk(int ptr, int size, rb_node **out_node) {
   chunk_t *blk = malloc(sizeof(chunk_t));
   blk->ptr = ptr;
   blk->size = size;
@@ -513,44 +513,46 @@ void update_max_size(rb_node *n) {
   }
 }
 
-bool block_less_by_ptr(const void *a, const void *b) {
+bool chunk_less_by_ptr(const void *a, const void *b) {
   const chunk_t *ba = a;
   const chunk_t *bb = b;
   return ba->ptr < bb->ptr;
 }
 
-rb_tree *create_block_file_rbtree(uint64_t total_size) {
+rb_tree *create_chunk_file_rbtree(uint64_t total_size) {
   uint64_t *ptr = malloc(sizeof(uint64_t));
   *ptr = total_size;
-  rb_tree *t = rb_create(block_less_by_ptr, update_max_size, ptr);
+  rb_tree *t = rb_create(chunk_less_by_ptr, update_max_size, ptr);
   rb_mfree(t, 0, total_size);
   return t;
 }
 
 int rbtree_file_insert(rb_tree *t, uint64_t ptr, uint64_t size) {
-  chunk_t *block = malloc(sizeof(chunk_t));
-  block->ptr = ptr;
-  block->size = size;
+  chunk_t *chunk = malloc(sizeof(chunk_t));
+  chunk->ptr = ptr;
+  chunk->size = size;
   chunk_aug_t *aug = malloc(sizeof(chunk_aug_t));
   aug->max_size = size;
 
-  return rb_insert(t, block, aug);
+  return rb_insert(t, chunk, aug);
 }
 
 int rbtree_file_delete(rb_tree *t, uint64_t ptr, uint64_t size) {
-  chunk_t *block = malloc(sizeof(chunk_t));
-  block->ptr = ptr;
-  block->size = size;
+  chunk_t *chunk = malloc(sizeof(chunk_t));
+  chunk->ptr = ptr;
+  chunk->size = size;
   chunk_aug_t *aug = malloc(sizeof(chunk_aug_t));
   aug->max_size = size;
 
-  return rb_delete(t, block);
+  int result = rb_delete(t, chunk);
+  free(chunk);
+  return result;
 }
 
 void read_node_data(rb_node *node, uint64_t *ptr, uint64_t *size, uint64_t *max_size) {
-  chunk_t *block = (chunk_t*)node->data;
-  *ptr = block->ptr;
-  *size = block->size;
+  chunk_t *chunk = (chunk_t*)node->data;
+  *ptr = chunk->ptr;
+  *size = chunk->size;
 
   chunk_aug_t *aug = (chunk_aug_t*)node->augmented;
   *max_size = aug->max_size;
@@ -595,12 +597,12 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     return -1;
   }
 
-  chunk_t *block = malloc(sizeof(block));
-  block->ptr = ptr;
-  block->size = size;
+  chunk_t *chunk = malloc(sizeof(chunk));
+  chunk->ptr = ptr;
+  chunk->size = size;
 
-  // Deal with block starting at ptr
-  chunk_t *b = (chunk_t*)rb_find(t, block);
+  // Deal with chunk starting at ptr
+  chunk_t *b = (chunk_t*)rb_find(t, chunk);
   if (b) {
     uint64_t b_ptr = b->ptr;
     uint64_t b_size = b->size;
@@ -611,13 +613,13 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     } 
   }
 
-  chunk_t *prev = (chunk_t*)rb_next_smaller(t, block);
-  chunk_t *next = (chunk_t*)rb_next_larger(t, block);
+  chunk_t *prev = (chunk_t*)rb_next_smaller(t, chunk);
+  chunk_t *next = (chunk_t*)rb_next_larger(t, chunk);
 
-  // interval lies entirely within an existing free block
+  // interval lies entirely within an existing free chunk
   // nothing needs to be done
   if (prev && prev->ptr + prev->size > ptr + size) {
-    free(block);
+    free(chunk);
     return 0;
   }
 
@@ -630,7 +632,7 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
     ptr = prev->ptr;
     size += a - c;
     rbtree_file_delete(t, prev->ptr, prev->size);
-    prev = (chunk_t*)rb_next_smaller(t, block);
+    prev = (chunk_t*)rb_next_smaller(t, chunk);
   }
 
   while (next && ptr + size >= next->ptr) {
@@ -644,12 +646,12 @@ int rb_mfree(rb_tree *t, uint64_t ptr, uint64_t size) {
       size += d - b;
     }
     rbtree_file_delete(t, next->ptr, next->size);
-    next = (chunk_t*)rb_next_larger(t, block);
+    next = (chunk_t*)rb_next_larger(t, chunk);
   }
   
   // At this point, there are no overlaps. Insert and return
   rbtree_file_insert(t, ptr, size);
-  free(block);
+  free(chunk);
   return 0;
 }
 
@@ -664,15 +666,15 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     return -1;
   }
 
-  chunk_t *block = malloc(sizeof(block));
-  block->ptr = ptr;
-  block->size = size;
+  chunk_t *chunk = malloc(sizeof(chunk));
+  chunk->ptr = ptr;
+  chunk->size = size;
 
-  chunk_t *prev = (chunk_t*)rb_next_smaller(t, block);
-  chunk_t *next = (chunk_t*)rb_next_larger(t, block);
+  chunk_t *prev = (chunk_t*)rb_next_smaller(t, chunk);
+  chunk_t *next = (chunk_t*)rb_next_larger(t, chunk);
 
-  // Deal with block starting at ptr
-  chunk_t *b = (chunk_t*) rb_find(t, block);
+  // Deal with chunk starting at ptr
+  chunk_t *b = (chunk_t*) rb_find(t, chunk);
   if (b) {
     uint64_t b_ptr = b->ptr;
     uint64_t b_size = b->size;
@@ -683,7 +685,7 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     }
   }
 
-  // interval lies entirely within an existing free block
+  // interval lies entirely within an existing free chunk
   while (prev && prev->ptr + prev->size > ptr + size) {
     // ---a******b------
     // -c***********d---
@@ -696,7 +698,7 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     rbtree_file_insert(t, c, a - c);
     rbtree_file_insert(t, b, d - b);
     
-    free(block);
+    free(chunk);
     return 0;
   }
 
@@ -707,7 +709,7 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     uint64_t c = prev->ptr;
     rbtree_file_delete(t, prev->ptr, prev->size);
     rbtree_file_insert(t, c, a - c);
-    prev = (chunk_t*)rb_next_smaller(t, block);
+    prev = (chunk_t*)rb_next_smaller(t, chunk);
   }
 
   // ---a******b------
@@ -721,10 +723,10 @@ int rb_malloc(rb_tree *t, uint64_t ptr, uint64_t size) {
     if (d > b) {
       rbtree_file_insert(t, b, d - b);
     }
-    next = (chunk_t*)rb_next_larger(t, block);
+    next = (chunk_t*)rb_next_larger(t, chunk);
   }
   
-  free(block);
+  free(chunk);
   return 0;
 }
 

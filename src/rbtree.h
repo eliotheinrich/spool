@@ -51,18 +51,18 @@ typedef struct {
   uint64_t max_size;
 } chunk_aug_t;
 
-rb_tree *create_block_file_rbtree(uint64_t total_size);
+rb_tree *create_chunk_file_rbtree(uint64_t total_size);
 int rbtree_file_insert(rb_tree *t, uint64_t ptr, uint64_t size);
 int rbtree_file_delete(rb_tree *t, uint64_t ptr, uint64_t size);
 
 // Comparison by left edge of interval
-bool block_less_by_ptr(const void *a, const void *b);
+bool chunk_less_by_ptr(const void *a, const void *b);
 
 // Block-file rbtree
 void update_max_size(rb_node *n);
 
 // Helper to create a node with augmented data
-chunk_t* make_block(int ptr, int size, rb_node **out_node);
+chunk_t* make_chunk(int ptr, int size, rb_node **out_node);
 
 // Assumes that tree stores ptr/size pairs and is augmented with max size
 int rb_get_free_ptr(rb_tree* root, uint64_t size, uint64_t *ptr);
